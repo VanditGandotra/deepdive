@@ -1,0 +1,65 @@
+{
+  "_meta": {
+    "fixture": "xbrl_quality_flags",
+    "description": "Synthetic quarterly financial data designed to trip exactly 3 of 5 quality flags: receivables_growing_faster (YES), inventory (NO), dso (YES), ocf_vs_netincome (YES), sbc (NO).",
+    "source": "synthetic",
+    "expected_flags": {
+      "receivables_growing_faster_than_revenue": "red",
+      "inventory_buildup": "green",
+      "dso_expanding": "red",
+      "ocf_vs_net_income": "yellow",
+      "sbc_as_pct_revenue": "green"
+    },
+    "expected_overall": "concerning"
+  },
+  "ticker": "SYNTH",
+  "quarterly_financials": {
+    "Revenue": {
+      "2024-10-01": 1000000000,
+      "2024-07-01": 980000000,
+      "2024-04-01": 950000000,
+      "2024-01-01": 900000000
+    },
+    "Net Income": {
+      "2024-10-01": 150000000,
+      "2024-07-01": 145000000,
+      "2024-04-01": 140000000,
+      "2024-01-01": 130000000
+    },
+    "Stock-Based Compensation": {
+      "2024-10-01": 20000000,
+      "2024-07-01": 19000000,
+      "2024-04-01": 18000000,
+      "2024-01-01": 17000000
+    }
+  },
+  "quarterly_balance_sheet": {
+    "Net Receivables": {
+      "2024-10-01": 250000000,
+      "2024-07-01": 200000000,
+      "2024-04-01": 175000000,
+      "2024-01-01": 160000000
+    },
+    "Inventory": {
+      "2024-10-01": 80000000,
+      "2024-07-01": 78000000,
+      "2024-04-01": 76000000,
+      "2024-01-01": 75000000
+    }
+  },
+  "quarterly_cashflow": {
+    "Operating Cash Flow": {
+      "2024-10-01": 100000000,
+      "2024-07-01": 130000000,
+      "2024-04-01": 125000000,
+      "2024-01-01": 120000000
+    }
+  },
+  "flag_reasoning": {
+    "receivables_growing_faster_than_revenue": "Receivables grew ~56% QoQ (from 160M to 250M over 3 quarters) vs revenue ~11%. Ratio triggers at >2x revenue growth rate.",
+    "inventory_buildup": "Inventory growth 6.7% vs revenue 11% — within threshold, no flag.",
+    "dso_expanding": "DSO: (250/1000)*90=22.5 days current vs (160/900)*90=16 days one year ago. Expansion >4 days triggers flag.",
+    "ocf_vs_net_income": "OCF 100M vs Net Income 150M = 67% conversion. Below 80% threshold triggers yellow (below 60% would be red).",
+    "sbc_as_pct_revenue": "SBC 20M / Revenue 1000M = 2% — below 10% threshold, no flag."
+  }
+}

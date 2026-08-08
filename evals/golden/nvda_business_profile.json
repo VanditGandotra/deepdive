@@ -1,0 +1,25 @@
+{
+  "_meta": {
+    "fixture": "nvda_business_profile",
+    "description": "Reference business profile for NVDA eval grounding checks. Extraction must hit these facts.",
+    "source": "synthetic"
+  },
+  "ticker": "NVDA",
+  "required_facts": {
+    "moat_keywords": ["CUDA", "software", "ecosystem", "developer", "lock-in"],
+    "segments": ["Data Center", "Gaming", "Automotive", "Professional Visualization"],
+    "top_risks_keywords": ["AMD", "Intel", "custom silicon", "export", "TSMC"],
+    "business_model_keywords": ["GPU", "accelerated computing", "AI", "inference", "training"]
+  },
+  "reference_profile": {
+    "what_they_do": "NVIDIA designs GPUs and accelerated computing platforms for AI training, inference, scientific computing, gaming, and automotive applications. Revenue is dominated by Data Center (Hopper/Blackwell GPU clusters sold to hyperscalers and enterprises) with Gaming as the second segment.",
+    "moat": "CUDA software ecosystem with 4M+ developers and 3500+ GPU-accelerated applications creates extreme switching costs. Customers rebuild entire MLOps stacks on NVIDIA primitives.",
+    "top_risks": [
+      "Custom silicon from hyperscalers (Google TPU, AWS Trainium, Microsoft Maia) could reduce GPU purchases",
+      "AMD MI300X gaining traction in inference workloads",
+      "US export controls on China, representing ~10-15% of historical revenue",
+      "TSMC concentration risk for advanced node supply",
+      "Blackwell yield and ramp execution risk"
+    ]
+  }
+}

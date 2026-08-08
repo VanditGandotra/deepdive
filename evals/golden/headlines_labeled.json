@@ -1,0 +1,41 @@
+{
+  "_meta": {
+    "fixture": "headlines_labeled",
+    "description": "30 synthetic headlines for NVDA with ground-truth category, direction, materiality. Min 80% direction accuracy required.",
+    "source": "synthetic"
+  },
+  "ticker": "NVDA",
+  "company_name": "NVIDIA Corporation",
+  "headlines": [
+    {"title": "NVIDIA Reports Record Q3 Revenue of $35.1B, Beats Estimates by $1.7B", "category": "earnings", "direction": "positive", "materiality": "high"},
+    {"title": "NVIDIA Blackwell GPU Shipments Begin, Ramp Expected in Q4", "category": "product", "direction": "positive", "materiality": "high"},
+    {"title": "US Expands AI Chip Export Controls, NVIDIA H100 Now Restricted to More Countries", "category": "regulatory", "direction": "negative", "materiality": "high"},
+    {"title": "Jensen Huang Sells $10M in NVIDIA Stock Under 10b5-1 Plan", "category": "management", "direction": "neutral", "materiality": "low"},
+    {"title": "AMD MI300X Gains Traction at Meta, Challenging NVIDIA Dominance", "category": "product", "direction": "negative", "materiality": "medium"},
+    {"title": "NVIDIA Partners With Saudi Aramco for AI Infrastructure Deployment", "category": "product", "direction": "positive", "materiality": "medium"},
+    {"title": "Federal Antitrust Probe Into NVIDIA's Acquisition of Mellanox Re-Examined", "category": "legal", "direction": "negative", "materiality": "medium"},
+    {"title": "Morgan Stanley Raises NVIDIA Price Target to $190, Cites Blackwell Demand", "category": "analyst_action", "direction": "positive", "materiality": "medium"},
+    {"title": "NVIDIA Data Center Revenue Climbs 112% YoY to $30.8B", "category": "earnings", "direction": "positive", "materiality": "high"},
+    {"title": "Google Announces Second-Gen TPU v5p to Compete With NVIDIA H100", "category": "product", "direction": "negative", "materiality": "medium"},
+    {"title": "NVIDIA Announces $50B Share Buyback Program", "category": "earnings", "direction": "positive", "materiality": "medium"},
+    {"title": "TSMC Says AI Chip Packaging Remains Tight Through 2025", "category": "macro", "direction": "negative", "materiality": "medium"},
+    {"title": "NVIDIA Cuts Price of A100 GPUs Amid Hopper Migration", "category": "product", "direction": "mixed", "materiality": "low"},
+    {"title": "Microsoft Azure Deploys First Blackwell Clusters for OpenAI", "category": "product", "direction": "positive", "materiality": "high"},
+    {"title": "China H20 Sales Top $4B in First Half, Surprising Analysts", "category": "earnings", "direction": "positive", "materiality": "medium"},
+    {"title": "NVIDIA Gross Margin Slips to 73% on Blackwell Ramp Costs", "category": "earnings", "direction": "negative", "materiality": "medium"},
+    {"title": "Blackwell Supply Constraints Expected Well Into 2025, Says Jensen Huang", "category": "product", "direction": "mixed", "materiality": "high"},
+    {"title": "NVIDIA GeForce RTX 5090 Unveiled at CES, Sets New Gaming Benchmark", "category": "product", "direction": "positive", "materiality": "low"},
+    {"title": "Short Interest in NVIDIA Hits 18-Month Low as Bears Capitulate", "category": "other", "direction": "positive", "materiality": "low"},
+    {"title": "EU Opens Probe Into NVIDIA's Planned Run:ai Acquisition", "category": "legal", "direction": "negative", "materiality": "medium"},
+    {"title": "Wells Fargo Downgrades NVIDIA to Equal Weight on Valuation Concerns", "category": "analyst_action", "direction": "negative", "materiality": "medium"},
+    {"title": "Fed Holds Rates; Data Center Capex Plans Unchanged at Major Hyperscalers", "category": "macro", "direction": "neutral", "materiality": "low"},
+    {"title": "NVIDIA Autonomous Vehicle Revenue Crosses $300M Quarterly Run Rate", "category": "earnings", "direction": "positive", "materiality": "medium"},
+    {"title": "NVIDIA Joins UAE Sovereign AI Initiative Worth $1.5B", "category": "product", "direction": "positive", "materiality": "medium"},
+    {"title": "Blackwell B200 Yields Improve to 60%+ as Ramp Accelerates, Sources Say", "category": "product", "direction": "positive", "materiality": "high"},
+    {"title": "NVIDIA CFO Colette Kress Reaffirms Mid-70s Long-Term Gross Margin Target", "category": "earnings", "direction": "positive", "materiality": "medium"},
+    {"title": "Amazon Trainium 2 Outperforms H100 on Specific LLM Training Tasks, Benchmarks Show", "category": "product", "direction": "negative", "materiality": "medium"},
+    {"title": "NVIDIA Expands CUDA Developer Program to 5 Million Registered Members", "category": "product", "direction": "positive", "materiality": "low"},
+    {"title": "Korean Pension Fund Trims NVIDIA Stake by 3% in Q3 Rebalancing", "category": "other", "direction": "neutral", "materiality": "low"},
+    {"title": "NVIDIA NIM Microservices Now Available on All Major Cloud Marketplaces", "category": "product", "direction": "positive", "materiality": "medium"}
+  ]
+}

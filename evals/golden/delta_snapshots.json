@@ -1,0 +1,89 @@
+{
+  "_meta": {
+    "fixture": "delta_snapshots",
+    "description": "Two RunSnapshot pairs with known diffs. Tests compute_diff determinism and delta narrative generation.",
+    "source": "synthetic"
+  },
+  "test_cases": [
+    {
+      "id": "pe_expansion_new_flag",
+      "description": "P/E expanded 30%, new quality flag appeared, short interest rose 15%",
+      "old_snapshot": {
+        "_run_at": "2024-10-01T10:00:00",
+        "ticker_or_url": "SYNTH",
+        "snapshot": {
+          "fundamentals": {
+            "pe_ttm": 25.0,
+            "revenue_ttm": 4000000000,
+            "market_cap": 500000000000
+          },
+          "short_interest_pct": 0.05,
+          "quality_flags": ["dso_expanding"],
+          "customer_list": ["Acme Corp", "Beta Inc"],
+          "last_30_days_count": 2
+        }
+      },
+      "new_snapshot": {
+        "fundamentals": {
+          "pe_ttm": 32.5,
+          "revenue_ttm": 4050000000,
+          "market_cap": 520000000000
+        },
+        "short_interest_pct": 0.0575,
+        "quality_flags": ["dso_expanding", "receivables_growing_faster_than_revenue"],
+        "customer_list": ["Acme Corp", "Beta Inc", "Gamma Ltd"],
+        "last_30_days_count": 5
+      },
+      "expected_diffs": {
+        "changed_fields": ["P/E TTM", "Market Cap"],
+        "new_flags": ["receivables_growing_faster_than_revenue"],
+        "cleared_flags": [],
+        "added_customers": ["Gamma Ltd"],
+        "removed_customers": [],
+        "short_interest_triggered": true,
+        "new_events": 3
+      },
+      "notes": "P/E up 30% (25→32.5) triggers 2% threshold. Revenue up 1.25% does NOT trigger (below 2%). Market cap up 4% triggers. SI up 15% triggers 10% threshold."
+    },
+    {
+      "id": "no_material_changes",
+      "description": "Sub-threshold changes — nothing should trigger",
+      "old_snapshot": {
+        "_run_at": "2024-11-01T10:00:00",
+        "ticker_or_url": "SYNTH2",
+        "snapshot": {
+          "fundamentals": {
+            "pe_ttm": 20.0,
+            "revenue_ttm": 2000000000,
+            "market_cap": 300000000000
+          },
+          "short_interest_pct": 0.08,
+          "quality_flags": [],
+          "customer_list": ["A Corp"],
+          "last_30_days_count": 1
+        }
+      },
+      "new_snapshot": {
+        "fundamentals": {
+          "pe_ttm": 20.3,
+          "revenue_ttm": 2010000000,
+          "market_cap": 301000000000
+        },
+        "short_interest_pct": 0.082,
+        "quality_flags": [],
+        "customer_list": ["A Corp"],
+        "last_30_days_count": 1
+      },
+      "expected_diffs": {
+        "changed_fields": [],
+        "new_flags": [],
+        "cleared_flags": [],
+        "added_customers": [],
+        "removed_customers": [],
+        "short_interest_triggered": false,
+        "new_events": 0
+      },
+      "notes": "P/E up 1.5%, revenue up 0.5%, market cap up 0.3%, SI up 2.5% — all below thresholds."
+    }
+  ]
+}
