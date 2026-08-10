@@ -15,6 +15,8 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 API_NINJAS_KEY = os.getenv("API_NINJAS_KEY", "")
 API_NINJAS_PREMIUM = os.getenv("API_NINJAS_PREMIUM", "").lower() == "true"
 ROIC_API_KEY = os.getenv("ROIC_API_KEY", "")
+FMP_API_KEY = os.getenv("FMP_API_KEY", "")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
 EDGAR_USER_AGENT = os.getenv("EDGAR_USER_AGENT", "DeepDive Research vandit@deductive.ai")
 
@@ -83,9 +85,12 @@ MAX_DOCS_PAGES     = 25
 MAX_IMAGES         = 15
 
 # ── Transcript provider endpoints ───────────────────────────────────────────
-API_NINJAS_TRANSCRIPT_URL = "https://api.api-ninjas.com/v1/earningstranscript"
-ROIC_TRANSCRIPT_LIST_URL  = "https://roic.ai/v3.0.0/earnings-calls"
-ROIC_TRANSCRIPT_DETAIL_URL = "https://roic.ai/v3.0.0/earnings-calls/{ecall_id}"
+API_NINJAS_TRANSCRIPT_URL    = "https://api.api-ninjas.com/v1/earningstranscript"
+ROIC_TRANSCRIPT_LIST_URL     = "https://roic.ai/v3.0.0/earnings-calls"
+ROIC_TRANSCRIPT_DETAIL_URL   = "https://roic.ai/v3.0.0/earnings-calls/{ecall_id}"
+FMP_TRANSCRIPT_URL           = "https://financialmodelingprep.com/api/v3/earning_call_transcript/{symbol}"
+FINNHUB_TRANSCRIPT_LIST_URL  = "https://finnhub.io/api/v1/stock/transcripts/list"
+FINNHUB_TRANSCRIPT_URL       = "https://finnhub.io/api/v1/stock/transcripts"
 
 # ── EDGAR endpoints ──────────────────────────────────────────────────────────
 EDGAR_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"

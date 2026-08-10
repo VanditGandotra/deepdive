@@ -7,7 +7,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import llm
 from analysis.schemas import CallDelta, CallSentiment, CallSummary, HedgingIndex
 from config import HAIKU, PROMPT_VERSIONS, SONNET
-from data.transcripts import get_last_n_transcripts
+from data.transcripts import get_available_provider_names, get_last_n_transcripts
 
 logger = logging.getLogger(__name__)
 
@@ -246,9 +246,10 @@ def analyse_all_calls(ticker: str, n: int = 4) -> Dict:
     Run Passes A+B for the last n transcripts.
     Returns {"transcripts", "summaries", "sentiments", "chunk_tags"}.
     """
+    providers_tried = get_available_provider_names()
     transcripts = get_last_n_transcripts(ticker, n=n)
     if not transcripts:
-        return {"transcripts": [], "summaries": [], "sentiments": [], "chunk_tags": {}}
+        return {"transcripts": [], "summaries": [], "sentiments": [], "chunk_tags": {}, "providers_tried": providers_tried}
 
     summaries: List[Optional[CallSummary]] = []
     sentiments: List[Optional[CallSentiment]] = []
@@ -265,4 +266,5 @@ def analyse_all_calls(ticker: str, n: int = 4) -> Dict:
         "summaries": summaries,
         "sentiments": sentiments,
         "chunk_tags": chunk_tags,
+        "providers_tried": providers_tried,
     }

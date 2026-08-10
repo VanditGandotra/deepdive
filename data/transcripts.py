@@ -1,13 +1,21 @@
 """Multi-provider earnings transcript fetcher with SQLite cache.
 
-Provider chain (highest priority first):
-  1. RoicProvider   — roic.ai v3 API (requires ROIC_API_KEY)
-  2. DefeatBetaProvider — defeatbeta-api parquet data (free, no key)
-  3. ApiNinjasProvider — api-ninjas.com (requires API_NINJAS_PREMIUM=true)
+Provider chain (priority order):
+  1. RoicProvider      — roic.ai v3 API (ROIC_API_KEY)
+  2. FmpProvider       — Financial Modeling Prep free tier (FMP_API_KEY, 250 req/day)
+  3. FinnhubProvider   — Finnhub paid plan (FINNHUB_API_KEY, Basic+ required)
+  4. DefeatBetaProvider — defeatbeta-api parquet (free, US-focused)
+  5. ApiNinjasProvider — api-ninjas.com (API_NINJAS_PREMIUM=true)
+  6. MotleyFoolProvider — web-scrape fallback via DuckDuckGo (always available)
+
+Ticker normalisation: FMP, Finnhub, and MotleyFool all accept US-listed tickers
+(ASML, TSM, etc.) directly. RoicProvider tries a broader exchange prefix list
+including AMS and EURONEXT so foreign dual-listings are found.
 """
 from __future__ import annotations
 
 import logging
+import re
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -17,6 +25,8 @@ import httpx
 
 from config import (
     API_NINJAS_KEY, API_NINJAS_PREMIUM, API_NINJAS_TRANSCRIPT_URL,
+    FINNHUB_API_KEY, FINNHUB_TRANSCRIPT_LIST_URL, FINNHUB_TRANSCRIPT_URL,
+    FMP_API_KEY, FMP_TRANSCRIPT_URL,
     ROIC_API_KEY, ROIC_TRANSCRIPT_DETAIL_URL, ROIC_TRANSCRIPT_LIST_URL,
     TTL_TRANSCRIPTS,
 )
@@ -25,8 +35,15 @@ from data.resilience import SourceUnavailable, retry
 
 logger = logging.getLogger(__name__)
 
-_CURRENT_YEAR = datetime.utcnow().year
 _MAX_ATTEMPTS = 8
+
+# Q&A boundary: Operator line that announces the session opening
+_QA_SPLIT_RE = re.compile(
+    r"(?m)^(?:Operator|OPERATOR)\s*:.*?"
+    r"(?:question[- ]and[- ]answer|Q&A|open.*?for question|"
+    r"begin.*?question|floor.*?question|now take.*?question)",
+    re.IGNORECASE,
+)
 
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
@@ -113,11 +130,47 @@ class TranscriptProvider(ABC):
         ...
 
 
+# ── Shared helpers ─────────────────────────────────────────────────────────────
+
+def _split_transcript_text(text: str) -> Tuple[str, str]:
+    """Split a plain-text transcript into (prepared_remarks, qa_section).
+
+    Searches for an Operator line that announces the Q&A session; everything
+    before it is prepared remarks, everything from it onward is Q&A.
+    Returns (full_text, "") when no boundary is found.
+    """
+    match = _QA_SPLIT_RE.search(text)
+    if match:
+        cut = match.start()
+        return text[:cut].strip(), text[cut:].strip()
+    return text.strip(), ""
+
+
+def _latest_likely_quarter() -> Tuple[int, int]:
+    """Best-guess at the most recently-reported fiscal quarter.
+
+    Assumes companies finish reporting within ~6 weeks of quarter end:
+      Q1 (Jan-Mar) → available May+
+      Q2 (Apr-Jun) → available Aug+
+      Q3 (Jul-Sep) → available Nov+
+      Q4 (Oct-Dec) → available Mar+ next year
+    """
+    now = datetime.utcnow()
+    m, y = now.month, now.year
+    if m >= 11:
+        return y, 3
+    if m >= 8:
+        return y, 2
+    if m >= 5:
+        return y, 1
+    return y - 1, 4
+
+
 # ── DefeatBeta provider (primary free tier) ───────────────────────────────────
 
 def _split_defeatbeta_df(df: Any, ticker: str, year: int, quarter: int, date: str, source: str) -> Transcript:
     """Split a defeatbeta transcript DataFrame into prepared_remarks / qa_section."""
-    import pandas as pd
+    import pandas as pd  # noqa: F401 (needed for type checking)
 
     # Find Q&A boundary: first Operator paragraph containing "question"
     qa_start_idx: Optional[int] = None
@@ -202,6 +255,10 @@ class DefeatBetaProvider(TranscriptProvider):
 
 # ── Roic.ai provider ──────────────────────────────────────────────────────────
 
+# Broader exchange prefix list to catch foreign dual-listings (e.g. AMS:ASML)
+_ROIC_EXCHANGES = ("NASDAQ", "NYSE", "TSX", "AMS", "EURONEXT", "LSE", "ETR", "HKEX")
+
+
 class RoicProvider(TranscriptProvider):
     """roic.ai v3 earnings-call API. Requires ROIC_API_KEY. 5 req/min free tier."""
     name = "roic"
@@ -251,7 +308,7 @@ class RoicProvider(TranscriptProvider):
     def _find_ecall(
         self, client: httpx.Client, ticker: str, year: int, quarter: int
     ) -> Tuple[Optional[str], Optional[str]]:
-        for exchange in ("NASDAQ", "NYSE", "TSX"):
+        for exchange in _ROIC_EXCHANGES:
             self._throttle()
             resp = client.get(
                 ROIC_TRANSCRIPT_LIST_URL,
@@ -281,7 +338,7 @@ class RoicProvider(TranscriptProvider):
                     ecall_id = item.get("id") or item.get("ecall_id")
                     date = item.get("date") or item.get("report_date")
                     return ecall_id, date
-            # Found the company but not the quarter
+            # Company found on this exchange but not this quarter
             if items:
                 return None, None
         return None, None
@@ -315,6 +372,154 @@ class RoicProvider(TranscriptProvider):
         return str(content) if content else None
 
 
+# ── Financial Modeling Prep provider ─────────────────────────────────────────
+
+class FmpProvider(TranscriptProvider):
+    """FMP earnings call transcripts. Free tier: 250 req/day (financialmodelingprep.com).
+
+    Covers US-listed tickers including foreign dual-listings like ASML and TSM.
+    Add FMP_API_KEY to .env — free plan is sufficient.
+    """
+    name = "fmp"
+
+    def available(self) -> bool:
+        return bool(FMP_API_KEY)
+
+    def fetch(self, ticker: str, year: int, quarter: int) -> Optional[Transcript]:
+        if not self.available():
+            return None
+        try:
+            return self._fetch(ticker, year, quarter)
+        except (SourceUnavailable, TranscriptRateLimited):
+            raise
+        except Exception as exc:
+            logger.debug("FmpProvider %s %d Q%d: %s", ticker, year, quarter, exc)
+            return None
+
+    def _fetch(self, ticker: str, year: int, quarter: int) -> Optional[Transcript]:
+        url = FMP_TRANSCRIPT_URL.format(symbol=ticker.upper())
+        with httpx.Client(timeout=20) as client:
+            resp = client.get(
+                url,
+                params={"year": year, "quarter": quarter, "apikey": FMP_API_KEY},
+            )
+        if resp.status_code == 401:
+            raise SourceUnavailable("FMP_API_KEY auth failed — check config")
+        if resp.status_code == 429:
+            ra = resp.headers.get("Retry-After")
+            raise TranscriptRateLimited(int(ra) if ra and ra.isdigit() else None)
+        if resp.status_code != 200:
+            return None
+
+        try:
+            data = resp.json()
+        except Exception:
+            return None
+        if not data or not isinstance(data, list):
+            return None
+
+        item = data[0]
+        content = (item.get("content") or "").strip()
+        if not content:
+            return None
+
+        prepared, qa = _split_transcript_text(content)
+        return Transcript(
+            ticker=ticker.upper(),
+            year=int(item.get("year", year)),
+            quarter=int(item.get("quarter", quarter)),
+            date=item.get("date"),
+            prepared_remarks=prepared,
+            qa_section=qa,
+            participants=[],
+            source=self.name,
+        )
+
+
+# ── Finnhub provider ──────────────────────────────────────────────────────────
+
+class FinnhubProvider(TranscriptProvider):
+    """Finnhub earnings call transcripts. Requires FINNHUB_API_KEY on a paid plan.
+
+    Transcripts are available on Finnhub's Basic plan (~$10/month) and above.
+    finnhub.io/pricing
+    """
+    name = "finnhub"
+
+    def available(self) -> bool:
+        return bool(FINNHUB_API_KEY)
+
+    def fetch(self, ticker: str, year: int, quarter: int) -> Optional[Transcript]:
+        if not self.available():
+            return None
+        try:
+            return self._fetch(ticker, year, quarter)
+        except (SourceUnavailable, TranscriptRateLimited):
+            raise
+        except Exception as exc:
+            logger.debug("FinnhubProvider %s %d Q%d: %s", ticker, year, quarter, exc)
+            return None
+
+    def _fetch(self, ticker: str, year: int, quarter: int) -> Optional[Transcript]:
+        with httpx.Client(timeout=20) as client:
+            list_resp = client.get(
+                FINNHUB_TRANSCRIPT_LIST_URL,
+                params={"symbol": ticker.upper(), "token": FINNHUB_API_KEY},
+            )
+            if list_resp.status_code == 403:
+                raise SourceUnavailable("Finnhub transcripts require a paid plan — see finnhub.io/pricing")
+            if list_resp.status_code == 401:
+                raise SourceUnavailable("FINNHUB_API_KEY auth failed — check config")
+            if list_resp.status_code == 429:
+                raise TranscriptRateLimited()
+            if list_resp.status_code != 200:
+                return None
+
+            transcripts_list = list_resp.json().get("transcripts") or []
+            transcript_id: Optional[str] = None
+            transcript_date: Optional[str] = None
+            for item in transcripts_list:
+                if item.get("year") == year and item.get("quarter") == quarter:
+                    transcript_id = item.get("id")
+                    transcript_date = item.get("date")
+                    break
+            if not transcript_id:
+                return None
+
+            detail_resp = client.get(
+                FINNHUB_TRANSCRIPT_URL,
+                params={"symbol": ticker.upper(), "id": transcript_id, "token": FINNHUB_API_KEY},
+            )
+            if detail_resp.status_code != 200:
+                return None
+
+        data = detail_resp.json()
+        content_entries = data.get("content") or []
+        if not content_entries:
+            return None
+
+        lines: List[str] = []
+        for entry in content_entries:
+            name = (entry.get("name") or "").strip()
+            for speech in (entry.get("speech") or []):
+                lines.append(f"{name}: {speech}" if name else str(speech))
+
+        full_text = "\n\n".join(lines)
+        prepared, qa = _split_transcript_text(full_text)
+        participants = list({e.get("name") for e in content_entries if e.get("name")})
+
+        return Transcript(
+            ticker=ticker.upper(),
+            year=year,
+            quarter=quarter,
+            date=str(transcript_date) if transcript_date else None,
+            prepared_remarks=prepared,
+            qa_section=qa,
+            participants=participants,
+            source=self.name,
+        )
+
+
 # ── API Ninjas provider (legacy / premium only) ───────────────────────────────
 
 class ApiNinjasProvider(TranscriptProvider):
@@ -342,13 +547,121 @@ class ApiNinjasProvider(TranscriptProvider):
         )
 
 
+# ── Motley Fool web-scrape provider (last resort) ─────────────────────────────
+
+class MotleyFoolProvider(TranscriptProvider):
+    """Web-scrape fallback: searches DuckDuckGo for Motley Fool transcript pages.
+
+    No API key required. Uses trafilatura for clean text extraction.
+    Throttled to 3 s/request to avoid rate-limiting.
+    This is intentionally last in the chain — structured API providers are faster
+    and return cleaner text. MotleyFool covers tickers missed by all other providers.
+    """
+    name = "motleyfool"
+    _last_req: float = 0.0
+    _min_interval: float = 3.0  # polite rate limit
+    _HEADERS: Dict[str, str] = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    def _throttle(self) -> None:
+        elapsed = time.monotonic() - MotleyFoolProvider._last_req
+        if elapsed < self._min_interval:
+            time.sleep(self._min_interval - elapsed)
+        MotleyFoolProvider._last_req = time.monotonic()
+
+    def fetch(self, ticker: str, year: int, quarter: int) -> Optional[Transcript]:
+        try:
+            return self._fetch(ticker, year, quarter)
+        except (SourceUnavailable, TranscriptRateLimited):
+            raise
+        except Exception as exc:
+            logger.debug("MotleyFoolProvider %s %d Q%d: %s", ticker, year, quarter, exc)
+            return None
+
+    def _find_url(self, ticker: str, year: int, quarter: int) -> Optional[str]:
+        """Search DuckDuckGo HTML for a Motley Fool transcript page."""
+        from urllib.parse import unquote
+
+        query = f'site:fool.com "{ticker.upper()}" "Q{quarter} {year}" earnings call transcript'
+        self._throttle()
+        with httpx.Client(timeout=15, headers=self._HEADERS, follow_redirects=True) as client:
+            resp = client.get("https://html.duckduckgo.com/html/", params={"q": query})
+        if resp.status_code != 200:
+            return None
+
+        found: List[str] = []
+        # Direct href links
+        for m in re.finditer(
+            r"https?://(?:www\.)?fool\.com/earnings/call-transcripts/[^\s\"'<>&]+",
+            resp.text,
+        ):
+            found.append(m.group(0).rstrip('/"'))
+        # DuckDuckGo redirect-encoded links
+        for m in re.finditer(r"uddg=([^&\"<>\s]+)", resp.text):
+            decoded = unquote(m.group(1))
+            if "fool.com/earnings/call-transcripts" in decoded:
+                found.append(decoded.rstrip('/"'))
+
+        if not found:
+            return None
+        # Prefer URLs that contain the year string
+        year_matches = [u for u in found if str(year) in u]
+        return (year_matches or found)[0]
+
+    def _fetch(self, ticker: str, year: int, quarter: int) -> Optional[Transcript]:
+        import trafilatura
+
+        url = self._find_url(ticker, year, quarter)
+        if not url:
+            logger.debug("MotleyFoolProvider: no URL found for %s Q%d %d", ticker, quarter, year)
+            return None
+
+        logger.info("MotleyFoolProvider: fetching %s", url)
+        self._throttle()
+        with httpx.Client(timeout=25, headers=self._HEADERS, follow_redirects=True) as client:
+            page = client.get(url)
+        if page.status_code != 200:
+            return None
+
+        text = trafilatura.extract(page.text, include_comments=False, include_tables=False)
+        if not text or len(text) < 500:
+            return None
+
+        prepared, qa = _split_transcript_text(text)
+        return Transcript(
+            ticker=ticker.upper(),
+            year=year,
+            quarter=quarter,
+            date=None,
+            prepared_remarks=prepared,
+            qa_section=qa,
+            participants=[],
+            source=self.name,
+        )
+
+
 # ── Provider chain ────────────────────────────────────────────────────────────
 
 _PROVIDERS: List[TranscriptProvider] = [
     RoicProvider(),
+    FmpProvider(),
+    FinnhubProvider(),
     DefeatBetaProvider(),
     ApiNinjasProvider(),
+    MotleyFoolProvider(),   # always available; keep last (slowest, web scrape)
 ]
+
+
+def get_available_provider_names() -> List[str]:
+    """Names of providers that pass the available() check in the current environment."""
+    return [p.name for p in _PROVIDERS if p.available()]
 
 
 def _get_transcript_from_chain(ticker: str, year: int, quarter: int) -> Optional[Transcript]:
@@ -389,17 +702,18 @@ def get_transcript(ticker: str, year: int, quarter: int) -> Optional[Dict[str, A
 
 
 def get_last_n_transcripts(ticker: str, n: int = 4) -> List[Dict[str, Any]]:
-    """
-    Walk backward through calendar quarters until n transcripts are collected
+    """Walk backward through calendar quarters until n transcripts are collected
     or _MAX_ATTEMPTS quarters are exhausted.
+
+    Starts from the most recently-reported quarter (not always Q4) so we don't
+    waste attempts on future quarters that cannot have transcripts yet.
 
     SourceUnavailable / TranscriptRateLimited propagate immediately.
     Missing quarters (None) are skipped silently.
     """
     results: List[Dict[str, Any]] = []
     attempts = 0
-    year = _CURRENT_YEAR
-    quarter = 4
+    year, quarter = _latest_likely_quarter()
 
     while len(results) < n and attempts < _MAX_ATTEMPTS:
         attempts += 1
@@ -417,10 +731,10 @@ def get_last_n_transcripts(ticker: str, n: int = 4) -> List[Dict[str, Any]]:
             quarter = 4
             year -= 1
 
-    if not results and attempts >= _MAX_ATTEMPTS:
+    if not results:
         logger.info(
-            "No transcripts found for %s after %d attempts (last checked %d Q%d)",
-            ticker, attempts, year, quarter,
+            "No transcripts found for %s after %d attempts; providers available: %s",
+            ticker, attempts, ", ".join(get_available_provider_names()) or "none",
         )
     return results
 

@@ -28,19 +28,20 @@ REPORTS_DIR.mkdir(exist_ok=True)
 # ── Feature → test node mapping ───────────────────────────────────────────────
 
 FEATURE_MAP: Dict[str, List[str]] = {
-    "schema":       ["evals/checks.py::TestSchemaConformance"],
-    "transcript":   ["evals/checks.py::TestTranscriptExtraction"],
-    "headlines":    ["evals/checks.py::TestHeadlineClassification"],
-    "grounding":    ["evals/checks.py::TestGroundingAudit"],
-    "delta":        ["evals/checks.py::TestDeltaDeterminism"],
-    "math":         ["evals/checks.py::TestReverseDCFMath"],
-    "cost":         ["evals/checks.py::TestCostRegression"],
-    "cache":        ["evals/checks.py::TestCacheLayer"],
-    "charts":       ["evals/checks.py::TestChartRendering"],
+    "schema":      ["evals/checks.py::TestSchemaConformance"],
+    "transcript":  ["evals/checks.py::TestTranscriptExtraction"],
+    "headlines":   ["evals/checks.py::TestHeadlineClassification"],
+    "grounding":   ["evals/checks.py::TestGroundingAudit"],
+    "delta":       ["evals/checks.py::TestDeltaDeterminism"],
+    "math":        ["evals/checks.py::TestReverseDCFMath"],
+    "cost":        ["evals/checks.py::TestCostRegression"],
+    "cache":       ["evals/checks.py::TestCacheLayer"],
+    "charts":      ["evals/checks.py::TestChartRendering"],
+    "providers":   ["evals/checks.py::TestTranscriptProviders"],
 }
 
 ALL_FEATURES = list(FEATURE_MAP.keys())
-FAST_FEATURES = ["schema", "delta", "math", "cost", "cache", "charts"]
+FAST_FEATURES = ["schema", "delta", "math", "cost", "cache", "charts", "providers"]
 
 
 # ── Pytest runner ─────────────────────────────────────────────────────────────

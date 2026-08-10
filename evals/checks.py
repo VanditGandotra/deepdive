@@ -37,6 +37,109 @@ def _schema_valid(obj: Any, model_class: Any) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Transcript Provider Chain
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestTranscriptProviders:
+    """Unit tests for the transcript provider chain — no network calls, no LLM."""
+
+    def test_split_qa_boundary_detected(self) -> None:
+        from data.transcripts import _split_transcript_text
+        text = (
+            "CEO: Revenue was $10B in the quarter.\n\n"
+            "CFO: Free cash flow was strong.\n\n"
+            "Operator: We will now begin the question-and-answer session.\n\n"
+            "Analyst: What is your guidance for next quarter?\n\n"
+            "CEO: We expect continued growth."
+        )
+        prepared, qa = _split_transcript_text(text)
+        assert "Revenue" in prepared
+        assert "question-and-answer" in qa
+        assert "guidance" in qa
+        assert "guidance" not in prepared
+
+    def test_split_no_qa_returns_full_and_empty(self) -> None:
+        from data.transcripts import _split_transcript_text
+        text = "CEO: Revenue was $10B.\n\nCFO: Margins expanded."
+        prepared, qa = _split_transcript_text(text)
+        assert qa == ""
+        assert "Revenue" in prepared
+
+    def test_split_open_floor_variant(self) -> None:
+        from data.transcripts import _split_transcript_text
+        text = (
+            "CFO: EBITDA margin was 28%.\n\n"
+            "Operator: Thank you. We will now open the floor for questions.\n\n"
+            "Analyst: Can you walk us through capex plans?"
+        )
+        prepared, qa = _split_transcript_text(text)
+        assert "EBITDA" in prepared
+        assert "capex" in qa
+
+    def test_latest_likely_quarter_valid_range(self) -> None:
+        from data.transcripts import _latest_likely_quarter
+        year, quarter = _latest_likely_quarter()
+        assert isinstance(year, int) and year >= 2020
+        assert quarter in (1, 2, 3, 4)
+
+    def test_latest_likely_quarter_not_future(self) -> None:
+        from datetime import datetime
+        from data.transcripts import _latest_likely_quarter
+        year, quarter = _latest_likely_quarter()
+        now = datetime.utcnow()
+        assert year <= now.year
+
+    def test_motleyfool_always_available(self) -> None:
+        from data.transcripts import MotleyFoolProvider
+        assert MotleyFoolProvider().available() is True
+
+    def test_motleyfool_last_in_chain(self) -> None:
+        from data.transcripts import _PROVIDERS, MotleyFoolProvider
+        assert isinstance(_PROVIDERS[-1], MotleyFoolProvider), (
+            "MotleyFoolProvider must be last (web scrape is the slowest fallback)"
+        )
+
+    def test_provider_names_unique(self) -> None:
+        from data.transcripts import _PROVIDERS
+        names = [p.name for p in _PROVIDERS]
+        assert len(names) == len(set(names)), f"Duplicate provider names: {names}"
+
+    def test_get_available_includes_motleyfool(self) -> None:
+        from data.transcripts import get_available_provider_names
+        assert "motleyfool" in get_available_provider_names()
+
+    def test_fmp_unavailable_without_key(self, monkeypatch) -> None:
+        import data.transcripts as dt
+        monkeypatch.setattr(dt, "FMP_API_KEY", "")
+        from data.transcripts import FmpProvider
+        assert FmpProvider().available() is False
+
+    def test_fmp_available_with_key(self, monkeypatch) -> None:
+        import data.transcripts as dt
+        monkeypatch.setattr(dt, "FMP_API_KEY", "testkey123")
+        from data.transcripts import FmpProvider
+        assert FmpProvider().available() is True
+
+    def test_finnhub_unavailable_without_key(self, monkeypatch) -> None:
+        import data.transcripts as dt
+        monkeypatch.setattr(dt, "FINNHUB_API_KEY", "")
+        from data.transcripts import FinnhubProvider
+        assert FinnhubProvider().available() is False
+
+    def test_six_providers_in_chain(self) -> None:
+        from data.transcripts import _PROVIDERS
+        assert len(_PROVIDERS) == 6, f"Expected 6 providers, got {len(_PROVIDERS)}"
+
+    def test_provider_chain_includes_fmp(self) -> None:
+        from data.transcripts import _PROVIDERS, FmpProvider
+        assert any(isinstance(p, FmpProvider) for p in _PROVIDERS)
+
+    def test_provider_chain_includes_finnhub(self) -> None:
+        from data.transcripts import _PROVIDERS, FinnhubProvider
+        assert any(isinstance(p, FinnhubProvider) for p in _PROVIDERS)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Schema Conformance
 # ══════════════════════════════════════════════════════════════════════════════
 

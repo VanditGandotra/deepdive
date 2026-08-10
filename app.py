@@ -437,7 +437,16 @@ def tab_earnings_calls(ticker: str, settings: Dict) -> None:
     sentiments = call_data["sentiments"]
 
     if not transcripts:
-        st.info(f"No transcripts available for **{ticker}** in the last 8 quarters from any configured provider.")
+        providers = call_data.get("providers_tried") or []
+        if providers:
+            tried_str = " · ".join(f"`{p}`" for p in providers)
+            st.info(
+                f"No transcripts found for **{ticker}** in the last 8 quarters. "
+                f"Providers tried: {tried_str}. "
+                f"Add `FMP_API_KEY` to .env (free at financialmodelingprep.com) for broader coverage."
+            )
+        else:
+            st.info(f"No transcript providers are configured for **{ticker}**. Add `FMP_API_KEY` to .env.")
         return
 
     # Sentiment trend chart
