@@ -935,7 +935,7 @@ def tab_peer_comps(ticker: str, settings: Dict) -> None:
     st.divider()
     st.markdown("**Metric comparison across peers**")
     import plotly.graph_objects as go
-    from ui.charts import _BASE_LAYOUT, _ACCENT, _GREEN, _RED, _MUTED
+    from ui.charts import _ACCENT, _GREEN, _RED, _MUTED, apply_base_layout
 
     cols = st.columns(3)
     for idx, (label, field, higher_is_better) in enumerate(numeric_metrics):
@@ -955,8 +955,7 @@ def tab_peer_comps(ticker: str, settings: Dict) -> None:
                 bar_colors.append(f"rgba(59,74,107,0.30)")
         fig = go.Figure(go.Bar(x=tickers_list, y=vals, marker_color=bar_colors, name=label))
         suffix = "x" if "P/E" in label or "EBITDA" in label or "P/S" in label else "%"
-        fig.update_layout(
-            **{k: v for k, v in _BASE_LAYOUT.items() if k not in ("xaxis", "yaxis")},
+        apply_base_layout(fig,
             height=200,
             title=dict(text=label, font=dict(size=12, weight=600)),
             margin=dict(l=4, r=4, t=32, b=4),
@@ -1031,7 +1030,7 @@ def tab_hiring_intel(url: str, domain: str) -> None:
     from analysis.job_intel import extract_hiring_intel
     from ui.components import error_card
     import plotly.graph_objects as go
-    from ui.charts import _BASE_LAYOUT, _ACCENT
+    from ui.charts import _ACCENT, apply_base_layout
 
     # Pull hiring signals from the company intel crawl (already cached)
     results_key = f"company_intel__{url}"
@@ -1073,8 +1072,7 @@ def tab_hiring_intel(url: str, domain: str) -> None:
             x=depts, y=counts,
             marker_color=_ACCENT,
         ))
-        fig.update_layout(
-            **{k: v for k, v in _BASE_LAYOUT.items() if k not in ("xaxis", "yaxis")},
+        apply_base_layout(fig,
             height=280, showlegend=False,
             margin=dict(l=4, r=4, t=20, b=4),
             yaxis=dict(title="Roles", gridcolor="rgba(26,26,26,0.06)", zeroline=False, showline=False),

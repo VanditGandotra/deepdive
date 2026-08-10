@@ -49,6 +49,27 @@ def _base_fig(**layout_kwargs) -> go.Figure:
     return fig
 
 
+def apply_base_layout(fig: go.Figure, **overrides: Any) -> go.Figure:
+    """Apply _BASE_LAYOUT to fig, with per-chart overrides winning on conflict.
+
+    Nested dict values (xaxis, yaxis, margin, legend, etc.) are deep-merged so
+    base defaults and per-chart customizations both survive. Prevents the
+    'multiple values for keyword argument' TypeError that occurs when the
+    _BASE_LAYOUT spread and explicit kwargs contain the same key (e.g. margin).
+    """
+    layout: Dict[str, Any] = {}
+    for k, base_v in _BASE_LAYOUT.items():
+        if k in overrides and isinstance(base_v, dict) and isinstance(overrides[k], dict):
+            layout[k] = {**base_v, **overrides[k]}   # override keys win in nested dicts
+        else:
+            layout[k] = base_v
+    for k, v in overrides.items():
+        if k not in layout:
+            layout[k] = v
+    fig.update_layout(**layout)
+    return fig
+
+
 # ── Price candlestick ─────────────────────────────────────────────────────────
 
 def price_candlestick(price_data: PriceData, title: str = "") -> go.Figure:
@@ -70,8 +91,7 @@ def price_candlestick(price_data: PriceData, title: str = "") -> go.Figure:
         x=dates, y=[b.volume for b in bars], name="Volume",
         marker_color=f"rgba(59,74,107,0.35)",
     ), row=2, col=1)
-    fig.update_layout(
-        **{k: v for k, v in _BASE_LAYOUT.items() if k not in ("xaxis", "yaxis")},
+    apply_base_layout(fig,
         title=dict(text=title or f"{price_data.ticker}", font=dict(size=13, weight=600)),
         xaxis_rangeslider_visible=False,
         height=480,
@@ -166,10 +186,7 @@ def beat_miss_chart(
         r_colors = [_GREEN if (r or 0) >= 0 else _RED for r in reactions]
         fig.add_trace(go.Bar(x=quarters, y=reactions, marker_color=r_colors,
                              name="Reaction %"), row=2, col=1)
-    fig.update_layout(
-        **{k: v for k, v in _BASE_LAYOUT.items() if k not in ("xaxis", "yaxis")},
-        height=350, barmode="group",
-    )
+    apply_base_layout(fig, height=350, barmode="group")
     return fig
 
 
@@ -244,10 +261,7 @@ def revenue_bars(
             line=dict(color=_RED, width=2), mode="lines+markers",
             marker=dict(size=5),
         ), secondary_y=True)
-    fig.update_layout(
-        **{k: v for k, v in _BASE_LAYOUT.items() if k not in ("xaxis", "yaxis")},
-        title=dict(text="Quarterly Revenue", font=dict(size=13)), height=330,
-    )
+    apply_base_layout(fig, title=dict(text="Quarterly Revenue", font=dict(size=13)), height=330)
     return fig
 
 
@@ -343,21 +357,11 @@ def dcf_contour_heatmap(
         hoverinfo="skip",
     ))
 
-    fig.update_layout(
-        **{k: v for k, v in _BASE_LAYOUT.items() if k not in ("xaxis", "yaxis")},
+    apply_base_layout(fig,
         height=420,
-        title=dict(
-            text=f"What growth does ${current:,.2f} require?",
-            font=dict(size=13, weight=600),
-        ),
-        xaxis=dict(
-            title=dict(text="Revenue CAGR %", font=dict(size=11)),
-            gridcolor=_GRID, zeroline=False, showline=False,
-        ),
-        yaxis=dict(
-            title=dict(text="Terminal FCF Margin %", font=dict(size=11)),
-            gridcolor=_GRID, zeroline=False, showline=False,
-        ),
+        title=dict(text=f"What growth does ${current:,.2f} require?", font=dict(size=13, weight=600)),
+        xaxis=dict(title=dict(text="Revenue CAGR %", font=dict(size=11)), gridcolor=_GRID, zeroline=False, showline=False),
+        yaxis=dict(title=dict(text="Terminal FCF Margin %", font=dict(size=11)), gridcolor=_GRID, zeroline=False, showline=False),
     )
 
     # Annotation on the bold line

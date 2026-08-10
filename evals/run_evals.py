@@ -36,10 +36,11 @@ FEATURE_MAP: Dict[str, List[str]] = {
     "math":         ["evals/checks.py::TestReverseDCFMath"],
     "cost":         ["evals/checks.py::TestCostRegression"],
     "cache":        ["evals/checks.py::TestCacheLayer"],
+    "charts":       ["evals/checks.py::TestChartRendering"],
 }
 
 ALL_FEATURES = list(FEATURE_MAP.keys())
-FAST_FEATURES = ["schema", "delta", "math", "cost", "cache"]
+FAST_FEATURES = ["schema", "delta", "math", "cost", "cache", "charts"]
 
 
 # ── Pytest runner ─────────────────────────────────────────────────────────────

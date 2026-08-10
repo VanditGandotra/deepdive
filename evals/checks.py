@@ -465,6 +465,128 @@ class TestCostRegression:
 # Cache Layer
 # ══════════════════════════════════════════════════════════════════════════════
 
+class TestChartRendering:
+    """Regression suite: every chart builder must not raise TypeError from layout kwargs.
+
+    These tests are fast (pure Python / Plotly, no LLM or network calls) and run
+    as part of the default FAST_FEATURES suite. They specifically guard against the
+    'multiple values for keyword argument' crash that occurs when a _BASE_LAYOUT
+    spread and explicit kwargs share a key (e.g. margin, xaxis).
+    """
+
+    def _fake_price_data(self):
+        from analysis.schemas import PriceBar, PriceData
+        from datetime import date
+        bars = [
+            PriceBar(date=date(2024, 1, i + 1), open=100.0 + i, high=105.0 + i,
+                     low=99.0 + i, close=102.0 + i, volume=1_000_000)
+            for i in range(20)
+        ]
+        return PriceData(ticker="TEST", period="1y", bars=bars)
+
+    def _fake_ratio(self):
+        from analysis.schemas import RatioHistory
+        return RatioHistory(
+            name="P/E", current=25.0,
+            history=[20.0, 22.0, 24.0, 25.0, 26.0],
+            median_5y=23.0, min_5y=18.0, max_5y=28.0,
+            description="Test ratio",
+        )
+
+    def test_price_candlestick_no_error(self) -> None:
+        import plotly.graph_objects as go
+        from ui.charts import price_candlestick
+        fig = price_candlestick(self._fake_price_data(), "TEST — 1y")
+        assert isinstance(fig, go.Figure)
+
+    def test_ratio_sparkline_no_error(self) -> None:
+        import plotly.graph_objects as go
+        from ui.charts import ratio_sparkline
+        fig = ratio_sparkline(self._fake_ratio())
+        assert isinstance(fig, go.Figure)
+
+    def test_sentiment_trend_chart_no_error(self) -> None:
+        import plotly.graph_objects as go
+        from ui.charts import sentiment_trend_chart
+        fig = sentiment_trend_chart(["Q1", "Q2", "Q3", "Q4"], [0.3, -0.1, 0.5, 0.2])
+        assert isinstance(fig, go.Figure)
+
+    def test_sentiment_mini_sparkline_no_error(self) -> None:
+        import plotly.graph_objects as go
+        from ui.charts import sentiment_mini_sparkline
+        fig = sentiment_mini_sparkline(["Q1", "Q2", "Q3"], [0.4, 0.2, 0.5], [0.1, -0.2, 0.3])
+        assert isinstance(fig, go.Figure)
+
+    def test_beat_miss_chart_no_error(self) -> None:
+        import plotly.graph_objects as go
+        from ui.charts import beat_miss_chart
+        fig = beat_miss_chart(["Q1", "Q2", "Q3"], [0.85, 0.90, 0.88], [0.90, 0.88, 0.92])
+        assert isinstance(fig, go.Figure)
+
+    def test_eps_surprise_bars_no_error(self) -> None:
+        import plotly.graph_objects as go
+        from ui.charts import eps_surprise_bars
+        records = [
+            {"period": f"Q{i+1} '24", "eps_surprise_pct": (i % 3 - 1) * 5.0,
+             "eps_est": 1.0, "eps_actual": 1.0 + (i % 3 - 1) * 0.05}
+            for i in range(4)
+        ]
+        fig = eps_surprise_bars(records)
+        assert isinstance(fig, go.Figure)
+
+    def test_revenue_bars_no_error(self) -> None:
+        import plotly.graph_objects as go
+        from ui.charts import revenue_bars
+        fig = revenue_bars(["Q1", "Q2", "Q3"], [1e9, 1.1e9, 1.2e9], [0.05, 0.10, 0.09])
+        assert isinstance(fig, go.Figure)
+
+    def test_apply_base_layout_margin_override_no_crash(self) -> None:
+        """Regression: explicit margin override must not produce 'multiple values' TypeError."""
+        import plotly.graph_objects as go
+        from ui.charts import apply_base_layout
+        fig = go.Figure()
+        apply_base_layout(fig, height=200, margin=dict(l=4, r=4, t=32, b=4), showlegend=False)
+        assert isinstance(fig, go.Figure)
+        assert fig.layout.margin.l == 4   # override value won
+
+    def test_apply_base_layout_xaxis_deep_merge(self) -> None:
+        """Regression: xaxis override must deep-merge with base, not drop base keys."""
+        import plotly.graph_objects as go
+        from ui.charts import _BASE_LAYOUT, apply_base_layout
+        fig = go.Figure()
+        apply_base_layout(fig, xaxis=dict(title="My X Axis"))
+        # Base xaxis.gridcolor must still be present after merge
+        assert fig.layout.xaxis.gridcolor == _BASE_LAYOUT["xaxis"]["gridcolor"]
+
+    def test_peer_comps_chart_pattern_no_crash(self) -> None:
+        """Regression: exact peer comps bar chart layout call must not raise."""
+        import plotly.graph_objects as go
+        from ui.charts import _ACCENT, apply_base_layout
+        fig = go.Figure(go.Bar(x=["AAPL", "MSFT"], y=[30.0, 28.0], marker_color=_ACCENT))
+        apply_base_layout(fig,
+            height=200,
+            title=dict(text="P/E TTM", font=dict(size=12, weight=600)),
+            margin=dict(l=4, r=4, t=32, b=4),
+            yaxis=dict(ticksuffix="x", gridcolor="rgba(26,26,26,0.06)", zeroline=False, showline=False),
+            xaxis=dict(gridcolor="rgba(26,26,26,0.06)", zeroline=False, showline=False),
+            showlegend=False,
+        )
+        assert isinstance(fig, go.Figure)
+
+    def test_hiring_intel_chart_pattern_no_crash(self) -> None:
+        """Regression: exact hiring intel bar chart layout call must not raise."""
+        import plotly.graph_objects as go
+        from ui.charts import _ACCENT, apply_base_layout
+        fig = go.Figure(go.Bar(x=["Engineering", "Sales", "G&A"], y=[12, 5, 3], marker_color=_ACCENT))
+        apply_base_layout(fig,
+            height=280, showlegend=False,
+            margin=dict(l=4, r=4, t=20, b=4),
+            yaxis=dict(title="Roles", gridcolor="rgba(26,26,26,0.06)", zeroline=False, showline=False),
+            xaxis=dict(gridcolor="rgba(26,26,26,0.06)", zeroline=False, showline=False),
+        )
+        assert isinstance(fig, go.Figure)
+
+
 class TestCacheLayer:
     """Round-trip tests for SQLite cache layer (no LLM calls)."""
 
