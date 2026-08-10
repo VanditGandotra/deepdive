@@ -250,6 +250,84 @@ def _stream(
                      cache_read, cache_write, cost, False, _session_id)
 
 
+# ── Web search synthesis ─────────────────────────────────────────────────────
+
+_WEB_SEARCH_TOOL: list = [{"type": "web_search_20250305", "name": "web_search"}]
+
+
+def web_search_synthesis(
+    prompt: str,
+    *,
+    cache_key: str = "",
+    max_turns: int = 4,
+    max_tokens: int = 1500,
+) -> str:
+    """
+    Run a web-search-augmented synthesis using Claude's built-in web search.
+    Returns the final text response. Cached by cache_key if provided (TTL=6h).
+    Falls back to empty string on any error so callers can degrade gracefully.
+    """
+    from config import TTL_NEWS
+    from data.cache import get_cache_obj, set_cache_obj
+
+    if cache_key:
+        cached = get_cache_obj(cache_key)
+        if cached:
+            return cached
+
+    client = _get_client()
+    messages: list = [{"role": "user", "content": prompt}]
+    result_text = ""
+
+    for _ in range(max_turns):
+        try:
+            response = client.messages.create(
+                model=SONNET,
+                max_tokens=max_tokens,
+                tools=_WEB_SEARCH_TOOL,
+                messages=messages,
+            )
+        except Exception as exc:
+            logger.warning("web_search_synthesis API error: %s", exc)
+            break
+
+        for block in response.content:
+            if getattr(block, "type", None) == "text":
+                result_text = block.text
+
+        if response.stop_reason == "end_turn":
+            break
+
+        if response.stop_reason == "tool_use":
+            messages.append({"role": "assistant", "content": response.content})
+            # For server-side web_search, the tool result is handled by Anthropic;
+            # we pass back any tool_result blocks that arrived in the response.
+            tool_results = []
+            for block in response.content:
+                block_type = getattr(block, "type", "")
+                if block_type == "tool_use":
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": getattr(block, "content", "") or "",
+                    })
+            if tool_results:
+                messages.append({"role": "user", "content": tool_results})
+            else:
+                break
+        else:
+            break
+
+    if cache_key and result_text:
+        set_cache_obj(cache_key, result_text, TTL_NEWS)
+
+    usage_est = estimate_cost(SONNET, sum(
+        getattr(m, "input_tokens", 0) for m in []
+    ), 0)
+    logger.info("web_search_synthesis done: %d chars", len(result_text))
+    return result_text
+
+
 # ── Batch API ─────────────────────────────────────────────────────────────────
 
 def _submit_batch(

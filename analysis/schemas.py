@@ -481,6 +481,30 @@ class ScreenExplanation(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Peer Comps
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PeerRow(BaseModel):
+    ticker: str
+    name: Optional[str] = None
+    market_cap: Optional[float] = None
+    pe_ttm: Optional[float] = None
+    pe_forward: Optional[float] = None
+    ev_ebitda: Optional[float] = None
+    price_to_sales: Optional[float] = None
+    gross_margin: Optional[float] = None
+    net_margin: Optional[float] = None
+    revenue_growth_yoy: Optional[float] = None
+    fcf_yield: Optional[float] = None
+    is_target: bool = False  # True for the stock being analyzed
+
+class PeerComps(BaseModel):
+    target_ticker: str
+    peers: List[PeerRow] = []
+    synthesis: str = ""  # Sonnet one-paragraph narrative
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # LLM Observability
 # ═══════════════════════════════════════════════════════════════════════════════
 

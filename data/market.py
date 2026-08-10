@@ -296,6 +296,50 @@ def get_estimates(ticker: str) -> Dict[str, Any]:
     return result
 
 
+def _quarter_label(dt: Any) -> str:
+    try:
+        ts = pd.Timestamp(dt)
+        q = (ts.month - 1) // 3 + 1
+        return f"Q{q} '{str(ts.year)[2:]}"
+    except Exception:
+        return str(dt)[:7]
+
+
+@retry(max_attempts=3, base_delay=2.0)
+def get_beat_miss_history(ticker: str) -> List[Dict[str, Any]]:
+    """Return last 8 quarters of EPS beat/miss data, chronological order."""
+    from config import TTL_ESTIMATES
+    cache_key = f"market:{ticker}:beat_miss"
+    cached = get_cache_obj(cache_key)
+    if cached:
+        return cached
+
+    yf_ticker = yf.Ticker(ticker)
+    records: List[Dict[str, Any]] = []
+
+    try:
+        eh = yf_ticker.earnings_history
+        if eh is not None and not eh.empty:
+            eh = eh.sort_index(ascending=False).head(8)
+            for dt, row in eh.iterrows():
+                eps_est = _safe_float(row.get("epsEstimate"))
+                eps_actual = _safe_float(row.get("epsActual"))
+                surprise_pct = _safe_float(row.get("surprisePercent"))
+                records.append({
+                    "period": _quarter_label(dt),
+                    "date": str(dt)[:10],
+                    "eps_est": eps_est,
+                    "eps_actual": eps_actual,
+                    "eps_surprise_pct": surprise_pct,
+                })
+    except Exception as exc:
+        logger.warning("beat_miss_history error for %s: %s", ticker, exc)
+
+    records = list(reversed(records))  # oldest → newest left to right
+    set_cache_obj(cache_key, records, TTL_ESTIMATES, source="yfinance")
+    return records
+
+
 @retry(max_attempts=3, base_delay=2.0)
 def get_insiders(ticker: str) -> List[InsiderTransaction]:
     cache_key = f"market:{ticker}:insiders"

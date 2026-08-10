@@ -1,7 +1,7 @@
 """Plotly chart builders. All return fig objects; callers do st.plotly_chart(fig)."""
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import plotly.graph_objects as go
@@ -170,6 +170,61 @@ def beat_miss_chart(
         **{k: v for k, v in _BASE_LAYOUT.items() if k not in ("xaxis", "yaxis")},
         height=350, barmode="group",
     )
+    return fig
+
+
+# ── EPS surprise bars ────────────────────────────────────────────────────────
+
+def eps_surprise_bars(records: List[Dict[str, Any]]) -> go.Figure:
+    """
+    Bar chart of EPS surprise % per quarter.
+    Green = beat, red = miss. Returns the figure; callers provide the summary line.
+    """
+    quarters = [r["period"] for r in records]
+    surprises = [r.get("eps_surprise_pct") for r in records]
+    eps_est = [r.get("eps_est") for r in records]
+    eps_actual = [r.get("eps_actual") for r in records]
+
+    colors = []
+    for s in surprises:
+        if s is None:
+            colors.append(_MUTED)
+        elif s >= 0:
+            colors.append(_GREEN)
+        else:
+            colors.append(_RED)
+
+    custom = []
+    for i in range(len(records)):
+        est = eps_est[i]
+        act = eps_actual[i]
+        sur = surprises[i]
+        custom.append((
+            f"Est: ${est:.2f}" if est is not None else "Est: N/A",
+            f"Act: ${act:.2f}" if act is not None else "Act: N/A",
+            f"{sur:+.1f}%" if sur is not None else "N/A",
+        ))
+
+    fig = _base_fig(
+        height=240,
+        title=dict(text="EPS Surprise % — last 8 quarters", font=dict(size=13, weight=600)),
+        margin=dict(l=8, r=8, t=40, b=8),
+    )
+    fig.add_trace(go.Bar(
+        x=quarters,
+        y=surprises,
+        marker_color=colors,
+        name="EPS Surprise %",
+        customdata=custom,
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "%{customdata[0]}<br>"
+            "%{customdata[1]}<br>"
+            "Surprise: %{customdata[2]}<extra></extra>"
+        ),
+    ))
+    fig.add_hline(y=0, line_color=_MUTED, line_width=1.2)
+    fig.update_yaxes(ticksuffix="%")
     return fig
 
 

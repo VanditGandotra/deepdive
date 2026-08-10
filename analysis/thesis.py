@@ -212,3 +212,25 @@ def get_red_team(
     except Exception as exc:
         logger.warning("Red team failed for %s: %s", ticker, exc)
         return None
+
+
+def fetch_web_context(ticker: str, company_name: str) -> str:
+    """
+    Fetch live analyst views, recent news, and market sentiment via web search.
+    Returns a formatted context block tagged [WEB] for use in thesis generation.
+    Cached 6h (TTL_NEWS). Returns empty string on failure.
+    """
+    cache_key = f"web_context:{ticker.upper()}"
+    prompt = (
+        f"Research {company_name} ({ticker}) for an equity investment memo. Find:\n"
+        "1. Most recent analyst upgrades/downgrades and price target changes (last 30 days)\n"
+        "2. Key news or events affecting the investment thesis (last 2 weeks)\n"
+        "3. Main bull arguments vs bear arguments being discussed by investors\n"
+        "4. Any management guidance updates or strategic announcements\n\n"
+        "Be specific: cite sources, dates, and exact figures. "
+        "Summarize in 3-4 concise paragraphs. Focus on what is NEW vs what the market already knows."
+    )
+    raw = llm.web_search_synthesis(prompt, cache_key=cache_key)
+    if not raw:
+        return ""
+    return f'<source id="[WEB]" note="Live web search — {company_name}">\n{raw}\n</source>'

@@ -108,6 +108,37 @@ def tab_overview(ticker: str, settings: Dict) -> None:
     if price and fund.week_52_low and fund.week_52_high:
         week_52_bar(price, fund.week_52_low, fund.week_52_high)
 
+    # ── 3b. Pre-earnings brief banner ────────────────────────────────────────
+    try:
+        from analysis.pre_earnings import build_pre_earnings_brief, days_to_earnings, should_show_brief
+        if should_show_brief(fund):
+            days_left = days_to_earnings(fund)
+            date_str = fund.next_earnings_date.strftime("%b %d") if fund.next_earnings_date else ""
+            with st.expander(
+                f"Earnings in {days_left} day{'s' if days_left != 1 else ''} ({date_str}) — click for pre-earnings brief",
+                expanded=(days_left is not None and days_left <= 3),
+            ):
+                brief_key = f"pre_earnings_{ticker}"
+                if brief_key not in st.session_state:
+                    from data.market import get_beat_miss_history, get_estimates
+                    from analysis.kpis import extract_kpis
+                    from analysis.calls import analyse_all_calls
+                    with st.spinner("Generating pre-earnings brief…"):
+                        bm = get_beat_miss_history(ticker)
+                        ests = get_estimates(ticker)
+                        kpi_sums: List[str] = []
+                        try:
+                            cd = analyse_all_calls(ticker, n=2)
+                            kpis = extract_kpis(ticker, cd)
+                            kpi_sums = [f"{k.kpi_name}: {k.trend_note}" for k in kpis]
+                        except Exception:
+                            pass
+                        brief = build_pre_earnings_brief(ticker, fund, bm, ests, kpi_sums)
+                    st.session_state[brief_key] = brief
+                st.markdown(st.session_state.get(brief_key, "Brief unavailable."))
+    except Exception:
+        pass
+
     st.divider()
 
     # ── 4. State of play (streamed, cached by content hash) ───────────────────
@@ -252,7 +283,34 @@ def tab_overview(ticker: str, settings: Dict) -> None:
 
     st.divider()
 
-    # ── 7. High-materiality news ──────────────────────────────────────────────
+    # ── 7. Earnings beat/miss tracker ─────────────────────────────────────────
+    st.markdown("**Earnings beat/miss — last 8 quarters**")
+    try:
+        from data.market import get_beat_miss_history
+        from ui.charts import eps_surprise_bars
+        bm = get_beat_miss_history(ticker)
+        if bm:
+            valid = [r for r in bm if r.get("eps_surprise_pct") is not None]
+            beats = sum(1 for r in valid if (r["eps_surprise_pct"] or 0) >= 0)
+            misses = len(valid) - beats
+            avg_surprise = (
+                sum(r["eps_surprise_pct"] for r in valid) / len(valid) if valid else 0
+            )
+            beat_color = "green" if beats >= misses else "red"
+            st.caption(
+                f":{beat_color}[Beat EPS {beats} of {len(valid)} quarters] · "
+                f"avg surprise {avg_surprise:+.1f}%"
+            )
+            fig = eps_surprise_bars(bm)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.caption("No earnings history data available.")
+    except Exception:
+        st.caption("Earnings beat/miss tracker unavailable.")
+
+    st.divider()
+
+    # ── 9. High-materiality news ──────────────────────────────────────────────
     st.markdown("**High-materiality news**")
     try:
         impacts = classify_headlines(ticker, fund.name or ticker)
@@ -425,6 +483,23 @@ def tab_earnings_calls(ticker: str, settings: Dict) -> None:
         st.caption("Need at least 2 quarters for synthesis.")
 
     freshness_badge(f"transcript:{ticker}:{transcripts[0].get('year')}:Q{transcripts[0].get('quarter')}", "Transcripts")
+
+    st.divider()
+    st.markdown("**Ask a question across all loaded transcripts**")
+    st.caption("Answers are cited to specific quarters. Retrieval is keyword-based — be specific.")
+
+    qa_input = st.text_input(
+        "Your question",
+        placeholder='e.g. "What did management say about gross margin expansion?"',
+        key=f"qa_input_{ticker}",
+    )
+    if st.button("Ask", type="secondary", key=f"qa_ask_{ticker}") and qa_input.strip():
+        from analysis.transcript_qa import answer_question
+        with st.spinner("Searching transcripts…"):
+            answer = answer_question(qa_input, transcripts)
+        st.markdown(answer)
+    elif f"qa_last_answer_{ticker}" in st.session_state:
+        st.markdown(st.session_state[f"qa_last_answer_{ticker}"])
 
 
 def tab_news(ticker: str, settings: Dict) -> None:
@@ -692,12 +767,28 @@ def tab_thesis_memo(ticker: str, settings: Dict) -> None:
     # ── Theses ────────────────────────────────────────────────────────────────
     with thesis_tab:
         st.caption("Bull / base / bear scenarios with confirm + kill signals. Sonnet, streaming.")
+        use_web_search = st.checkbox(
+            "Augment with live web search",
+            value=False,
+            help="Fetches recent analyst upgrades, news, and investor discussion via Claude web search. Adds ~$0.02–0.05 per run, cached 6h.",
+            key=f"web_search_{ticker}",
+        )
         if st.button("Generate Theses", type="primary"):
             container = st.empty()
             try:
+                web_ctx = ""
+                if use_web_search:
+                    from analysis.thesis import fetch_web_context
+                    with st.spinner("Searching web for latest analyst views…"):
+                        web_ctx = fetch_web_context(ticker, fund.name or ticker)
+                    if web_ctx:
+                        st.caption("Web search complete — live context added to thesis.")
+                    else:
+                        st.caption("Web search returned no results — proceeding without.")
                 token_iter, chunks = stream_theses(
                     ticker, fund, dcf, call_delta, quality, positioning,
                     high_mat_news, kpi_summaries,
+                    estimates_summary=web_ctx,
                 )
                 thesis_text = streaming_container(token_iter, container)
                 st.session_state[f"thesis_text_{ticker}"] = thesis_text
@@ -762,6 +853,111 @@ def tab_thesis_memo(ticker: str, settings: Dict) -> None:
                 error_card("Memo generation error", str(exc))
 
 
+def tab_peer_comps(ticker: str, settings: Dict) -> None:
+    from analysis.peers import get_peer_comps, _DEFAULT_PEERS
+    from ui.components import error_card
+    import pandas as pd
+
+    st.caption("Compare key ratios against sector peers. Edit the peer list then click Load.")
+
+    default_peers = _DEFAULT_PEERS.get(ticker.upper(), [])
+    peer_input = st.text_input(
+        "Peer tickers (comma-separated)",
+        value=", ".join(default_peers),
+        key=f"peers_input_{ticker}",
+        placeholder="e.g. AMD, INTC, QCOM",
+    )
+
+    if st.button("Load Peer Comps", type="primary", key=f"peers_load_{ticker}"):
+        parsed = [t.strip().upper() for t in peer_input.split(",") if t.strip()]
+        with st.spinner(f"Fetching fundamentals for {ticker} + {len(parsed)} peers…"):
+            try:
+                comps = get_peer_comps(ticker, parsed)
+                st.session_state[f"peer_comps_{ticker}"] = comps
+            except Exception as exc:
+                error_card("Peer comps error", str(exc))
+                return
+
+    comps = st.session_state.get(f"peer_comps_{ticker}")
+    if not comps:
+        st.info("Enter peer tickers above and click Load Peer Comps.")
+        return
+
+    if comps.synthesis:
+        st.info(comps.synthesis)
+
+    # Build DataFrame
+    def _pct(v):
+        return f"{v*100:.1f}%" if v is not None else "—"
+    def _x(v):
+        return f"{v:.1f}x" if v is not None else "—"
+    def _b(v):
+        return f"${v/1e9:.1f}B" if v is not None else "—"
+
+    rows = []
+    for r in comps.peers:
+        rows.append({
+            "": "★ " + r.ticker if r.is_target else r.ticker,
+            "Name": (r.name or "")[:25],
+            "Mkt Cap": _b(r.market_cap),
+            "P/E TTM": _x(r.pe_ttm),
+            "Fwd P/E": _x(r.pe_forward),
+            "EV/EBITDA": _x(r.ev_ebitda),
+            "P/S": _x(r.price_to_sales),
+            "Gross Margin": _pct(r.gross_margin),
+            "Net Margin": _pct(r.net_margin),
+            "Rev Growth": _pct(r.revenue_growth_yoy),
+            "FCF Yield": _pct(r.fcf_yield),
+        })
+
+    df = pd.DataFrame(rows)
+    st.dataframe(df, hide_index=True, use_container_width=True)
+
+    # Per-metric sparkline bars (cheapest/most expensive highlights)
+    numeric_metrics = [
+        ("P/E TTM", "pe_ttm", False),       # lower = cheaper
+        ("Fwd P/E", "pe_forward", False),
+        ("EV/EBITDA", "ev_ebitda", False),
+        ("Rev Growth %", "revenue_growth_yoy", True),  # higher = better
+        ("Net Margin %", "net_margin", True),
+        ("FCF Yield %", "fcf_yield", True),
+    ]
+    st.divider()
+    st.markdown("**Metric comparison across peers**")
+    import plotly.graph_objects as go
+    from ui.charts import _BASE_LAYOUT, _ACCENT, _GREEN, _RED, _MUTED
+
+    cols = st.columns(3)
+    for idx, (label, field, higher_is_better) in enumerate(numeric_metrics):
+        values = [(r.ticker, getattr(r, field)) for r in comps.peers if getattr(r, field) is not None]
+        if not values:
+            continue
+        tickers_list = [v[0] for v in values]
+        vals = [v[1] for v in values]
+        if "growth" in field or "margin" in field or "yield" in field:
+            vals = [v * 100 for v in vals]
+        target_val = next((v for t, v in zip(tickers_list, vals) if t == ticker.upper()), None)
+        bar_colors = []
+        for t, v in zip(tickers_list, vals):
+            if t == ticker.upper():
+                bar_colors.append(_ACCENT)
+            else:
+                bar_colors.append(f"rgba(59,74,107,0.30)")
+        fig = go.Figure(go.Bar(x=tickers_list, y=vals, marker_color=bar_colors, name=label))
+        suffix = "x" if "P/E" in label or "EBITDA" in label or "P/S" in label else "%"
+        fig.update_layout(
+            **{k: v for k, v in _BASE_LAYOUT.items() if k not in ("xaxis", "yaxis")},
+            height=200,
+            title=dict(text=label, font=dict(size=12, weight=600)),
+            margin=dict(l=4, r=4, t=32, b=4),
+            yaxis=dict(ticksuffix=suffix, gridcolor="rgba(26,26,26,0.06)", zeroline=False, showline=False),
+            xaxis=dict(gridcolor="rgba(26,26,26,0.06)", zeroline=False, showline=False),
+            showlegend=False,
+        )
+        with cols[idx % 3]:
+            st.plotly_chart(fig, use_container_width=True, key=f"peer_bar_{ticker}_{field}")
+
+
 def run_ticker_mode(ticker: str, settings: Dict) -> None:
     from data.market import get_fundamentals
     from ui.components import cost_footer
@@ -782,6 +978,7 @@ def run_ticker_mode(ticker: str, settings: Dict) -> None:
         "Earnings Calls",
         "News",
         "Analyst Mode",
+        "Peer Comps",
         "Thesis & Memo",
     ])
 
@@ -796,6 +993,8 @@ def run_ticker_mode(ticker: str, settings: Dict) -> None:
     with tabs[4]:
         tab_analyst_mode(ticker, settings)
     with tabs[5]:
+        tab_peer_comps(ticker, settings)
+    with tabs[6]:
         tab_thesis_memo(ticker, settings)
 
 
@@ -803,16 +1002,182 @@ def run_ticker_mode(ticker: str, settings: Dict) -> None:
 # URL MODE TABS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def tab_hiring_intel(url: str, domain: str) -> None:
+    from analysis.job_intel import extract_hiring_intel
+    from ui.components import error_card
+    import plotly.graph_objects as go
+    from ui.charts import _BASE_LAYOUT, _ACCENT
+
+    # Pull hiring signals from the company intel crawl (already cached)
+    results_key = f"company_intel__{url}"
+    ci = st.session_state.get(results_key)
+    if not ci:
+        st.info("Run Company Intel first — hiring data is extracted from the same crawl.")
+        return
+
+    # Collect all hiring signals from page intels stored in session
+    hiring_signals_key = f"hiring_signals__{url}"
+    if hiring_signals_key not in st.session_state:
+        # Try to re-derive from the cached page_intels
+        st.info("Hiring signals are collected during the Company Intel crawl. Re-run Company Intel to populate.")
+        return
+
+    hiring_signals = st.session_state[hiring_signals_key]
+    with st.spinner("Clustering job postings by department…"):
+        intel = extract_hiring_intel(domain, hiring_signals)
+
+    dept_counts = intel.get("department_counts") or {}
+    roadmap = intel.get("roadmap_signals") or []
+    standout = intel.get("standout_roles") or []
+
+    if not dept_counts and not roadmap:
+        st.info("Insufficient hiring data found on this site.")
+        return
+
+    if roadmap:
+        st.markdown("**What hiring reveals about strategy**")
+        for signal in roadmap:
+            st.markdown(f"- {signal}")
+
+    if dept_counts:
+        st.divider()
+        st.markdown("**Open roles by department**")
+        depts = list(dept_counts.keys())
+        counts = [dept_counts[d] for d in depts]
+        fig = go.Figure(go.Bar(
+            x=depts, y=counts,
+            marker_color=_ACCENT,
+        ))
+        fig.update_layout(
+            **{k: v for k, v in _BASE_LAYOUT.items() if k not in ("xaxis", "yaxis")},
+            height=280, showlegend=False,
+            margin=dict(l=4, r=4, t=20, b=4),
+            yaxis=dict(title="Roles", gridcolor="rgba(26,26,26,0.06)", zeroline=False, showline=False),
+            xaxis=dict(gridcolor="rgba(26,26,26,0.06)", zeroline=False, showline=False),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    if standout:
+        st.divider()
+        st.markdown("**Standout / unusual roles**")
+        for r in standout:
+            st.markdown(f"- {r}")
+
+
+def tab_competitors(url: str, domain: str) -> None:
+    from analysis.competitors import discover_competitors, build_competitive_comparison
+    from ui.components import error_card
+
+    st.caption("Auto-discovers 3-5 competitors then crawls each for a side-by-side feature comparison.")
+
+    # We need a summary of the target product to find competitors
+    results_key = f"company_intel__{url}"
+    ci = st.session_state.get(results_key)
+    company_summary = (ci or {}).get("synthesis_text", "") or domain
+
+    if st.button("Discover & Compare Competitors", type="primary", key=f"comp_discover_{domain}"):
+        comp_key = f"competitors__{domain}"
+        with st.spinner("Identifying competitors (Sonnet)…"):
+            competitors = discover_competitors(domain, company_summary)
+        if not competitors:
+            st.warning("Could not identify competitors automatically. Try running Company Intel first.")
+            return
+        st.caption(f"Identified: {', '.join(c.get('name', c['domain']) for c in competitors)}")
+        with st.spinner(f"Crawling {len(competitors)} competitor sites…"):
+            comparison = build_competitive_comparison(domain, company_summary, competitors)
+        st.session_state[comp_key] = {"competitors": competitors, "comparison": comparison}
+
+    comp_key = f"competitors__{domain}"
+    comp_data = st.session_state.get(comp_key)
+    if not comp_data:
+        st.info("Click the button above to start competitor discovery.")
+        return
+
+    competitors = comp_data.get("competitors", [])
+    comparison = comp_data.get("comparison", "")
+
+    if competitors:
+        st.markdown("**Competitors identified**")
+        for c in competitors:
+            st.markdown(f"- [{c.get('name', c['domain'])}](https://{c['domain']})")
+
+    if comparison:
+        st.divider()
+        st.markdown(comparison)
+
+
+def tab_reviews(url: str, domain: str) -> None:
+    from analysis.review_sentiment import fetch_review_sentiment
+    from ui.components import error_card
+
+    st.caption("Searches G2, Capterra, and Product Hunt for customer reviews.")
+
+    reviews_key = f"reviews__{domain}"
+    if reviews_key not in st.session_state:
+        if st.button("Fetch Customer Reviews", type="primary", key=f"reviews_btn_{domain}"):
+            with st.spinner("Checking G2, Capterra, and Product Hunt…"):
+                reviews = fetch_review_sentiment(domain)
+            st.session_state[reviews_key] = reviews
+    else:
+        reviews = st.session_state[reviews_key]
+        if not reviews:
+            st.info("No review data found on G2, Capterra, or Product Hunt for this domain.")
+            return
+
+        for r in reviews:
+            platform = r.get("platform", "Unknown")
+            stars = r.get("star_rating")
+            count = r.get("review_count")
+            with st.expander(
+                f"**{platform}** — {'★' * int(stars or 0)}{f' {stars:.1f}/5' if stars else ''}"
+                f"{f' · {count:,} reviews' if count else ''}",
+                expanded=True,
+            ):
+                summary = r.get("sentiment_summary")
+                if summary:
+                    st.info(summary)
+
+                col1, col2 = st.columns(2)
+                pros = r.get("top_pros") or []
+                cons = r.get("top_cons") or []
+                with col1:
+                    if pros:
+                        st.markdown("**Top pros**")
+                        for p in pros:
+                            st.markdown(f"+ {p}")
+                with col2:
+                    if cons:
+                        st.markdown("**Top cons**")
+                        for c in cons:
+                            st.markdown(f"- {c}")
+
+                use_cases = r.get("common_use_cases") or []
+                if use_cases:
+                    st.caption("Common use cases: " + " · ".join(use_cases))
+
+    if reviews_key in st.session_state and not st.session_state.get(reviews_key):
+        if st.button("Fetch Customer Reviews", type="primary", key=f"reviews_btn2_{domain}"):
+            with st.spinner("Checking G2, Capterra, and Product Hunt…"):
+                st.session_state[reviews_key] = fetch_review_sentiment(domain)
+            st.rerun()
+
+
 def run_url_mode(url: str, settings: Dict) -> None:
     domain = url.replace("https://", "").replace("http://", "").split("/")[0]
     st.markdown(f"## {domain}")
 
-    tabs = st.tabs(["Company Intel", "Product Deep Dive"])
+    tabs = st.tabs(["Company Intel", "Product Deep Dive", "Hiring Intel", "Competitors", "Reviews"])
 
     with tabs[0]:
         tab_company_intel(url, domain)
     with tabs[1]:
         tab_product_deep_dive(url, domain)
+    with tabs[2]:
+        tab_hiring_intel(url, domain)
+    with tabs[3]:
+        tab_competitors(url, domain)
+    with tabs[4]:
+        tab_reviews(url, domain)
 
 
 def tab_company_intel(url: str, domain: str) -> None:
@@ -886,6 +1251,10 @@ def tab_company_intel(url: str, domain: str) -> None:
 
         # Persist snapshot — guarded against empty content inside run_delta
         run_delta(url, snap_data)
+
+        # Collect hiring signals for the Hiring Intel tab
+        all_hiring_signals = [s for intel in page_intels for s in intel.hiring_signals]
+        st.session_state[f"hiring_signals__{url}"] = all_hiring_signals
 
         # Store results in session_state so reruns don't re-execute pipeline
         st.session_state[results_key] = {
