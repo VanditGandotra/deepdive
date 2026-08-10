@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
 from analysis.schemas import Fundamentals, RatioGroup, RatioHistory
 from data.market import get_fundamentals, get_prices
@@ -77,6 +76,7 @@ def _sparkline_stats(hist: List[Optional[float]]) -> tuple:
 # ── Annual data fetch ─────────────────────────────────────────────────────────
 
 def _fetch_annual_data(ticker: str) -> Dict[str, Optional[pd.DataFrame]]:
+    import yfinance as yf
     yf_t = yf.Ticker(ticker)
     result: Dict[str, Optional[pd.DataFrame]] = {}
     for attr, key in [

@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
 from analysis.schemas import QualityFlag, QualityPanel
 
@@ -300,6 +299,7 @@ def _flag_sbc(
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 def get_quality_panel(ticker: str) -> QualityPanel:
+    import yfinance as yf
     yf_t = yf.Ticker(ticker)
     q_income, q_balance, q_cashflow = None, None, None
     try:

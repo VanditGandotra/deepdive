@@ -28,6 +28,7 @@ cache.db-wal
 *.db
 *.db-shm
 *.db-wal
+.cache/
 
 # Test artifacts
 .pytest_cache/

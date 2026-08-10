@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterator, List, Optional
@@ -24,6 +25,12 @@ _URL_PATTERN = re.compile(r"(https?://|www\.)|[a-zA-Z0-9-]+\.[a-zA-Z]{2,}")
 _TICKER_PATTERN = re.compile(r"^[A-Z]{1,5}$")
 
 
+def _record_timing(key: str, elapsed: float) -> None:
+    if "_timings" not in st.session_state:
+        st.session_state["_timings"] = {}
+    st.session_state["_timings"][key] = elapsed
+
+
 def detect_mode(text: str) -> tuple[str, str]:
     stripped = text.strip()
     if _URL_PATTERN.search(stripped):
@@ -44,18 +51,20 @@ def validate_ticker(t: str) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def tab_overview(ticker: str, settings: Dict) -> None:
-    from analysis.expectations import reverse_dcf
-    from analysis.news_impact import classify_headlines, high_materiality
-    from analysis.quality import get_quality_panel
+    from analysis.news_impact import high_materiality
+    from analysis.pre_earnings import build_pre_earnings_brief, days_to_earnings, should_show_brief
     from analysis.sentiment import aggregate_sentiment_scores
-    from analysis.calls import analyse_all_calls
     from analysis.state_of_play import stream_state_of_play
     from data.cache import get_last_run_snapshot
-    from data.market import get_fundamentals, get_short_interest
-    from ui.charts import sentiment_mini_sparkline
+    from ui.charts import eps_surprise_bars, sentiment_mini_sparkline
     from ui.components import (
         analyst_consensus_bar, analyst_target_bar, delta_card, error_card,
         fmt_money, fmt_pct, fmt_ratio, metric_card, streaming_container, week_52_bar,
+    )
+    from ui.stcache import (
+        cached_beat_miss, cached_calls, cached_estimates, cached_fundamentals,
+        cached_headlines, cached_quality_panel, cached_ratio_groups,
+        cached_reverse_dcf, cached_short_interest,
     )
 
     # ── 1. Delta card ─────────────────────────────────────────────────────────
@@ -65,17 +74,51 @@ def tab_overview(ticker: str, settings: Dict) -> None:
     else:
         delta_card(last_snap_raw)
 
-    # ── 2. Load core data ─────────────────────────────────────────────────────
+    # ── 2. Parallel prefetch all data needed for this tab ────────────────────
+    t0 = time.perf_counter()
+    with st.spinner("Loading overview data…"):
+        with ThreadPoolExecutor(max_workers=7) as pool:
+            f_fund   = pool.submit(cached_fundamentals, ticker)
+            f_si     = pool.submit(cached_short_interest, ticker)
+            f_qual   = pool.submit(cached_quality_panel, ticker)
+            f_calls  = pool.submit(cached_calls, ticker, 4)
+            f_bm     = pool.submit(cached_beat_miss, ticker)
+            f_dcf    = pool.submit(cached_reverse_dcf, ticker)
+            f_ratios = pool.submit(cached_ratio_groups, ticker)
+
     try:
-        fund = get_fundamentals(ticker)
-        si = get_short_interest(ticker)
+        fund = f_fund.result()
     except Exception as exc:
         error_card("Market data unavailable", str(exc))
         return
 
+    si = quality = call_data = dcf_for_sop = ratio_groups = None
+    bm: List = []
+    try: si = f_si.result()
+    except Exception: pass
+    try: quality = f_qual.result()
+    except Exception: pass
+    try: call_data = f_calls.result() or {}
+    except Exception: call_data = {}
+    try: bm = f_bm.result() or []
+    except Exception: pass
+    try: dcf_for_sop = f_dcf.result()
+    except Exception: pass
+    try: ratio_groups = f_ratios.result() or []
+    except Exception: ratio_groups = []
+
+    elapsed_data = time.perf_counter() - t0
+    _record_timing(f"overview_data_{ticker}", elapsed_data)
+
+    # Headlines depend on fund.name — fetched after parallel batch
+    impacts_for_news: List = []
+    try:
+        impacts_for_news = cached_headlines(ticker, fund.name or ticker)
+    except Exception:
+        pass
+
     # ── 3. Header strip ───────────────────────────────────────────────────────
     price = fund.current_price
-    prev = fund.previous_close
     chg_pct = fund.day_change_pct
     chg_str = fmt_pct(chg_pct) if chg_pct is not None else "—"
     chg_cls = "dd-change-pos" if (chg_pct or 0) >= 0 else "dd-change-neg"
@@ -110,7 +153,6 @@ def tab_overview(ticker: str, settings: Dict) -> None:
 
     # ── 3b. Pre-earnings brief banner ────────────────────────────────────────
     try:
-        from analysis.pre_earnings import build_pre_earnings_brief, days_to_earnings, should_show_brief
         if should_show_brief(fund):
             days_left = days_to_earnings(fund)
             date_str = fund.next_earnings_date.strftime("%b %d") if fund.next_earnings_date else ""
@@ -120,17 +162,14 @@ def tab_overview(ticker: str, settings: Dict) -> None:
             ):
                 brief_key = f"pre_earnings_{ticker}"
                 if brief_key not in st.session_state:
-                    from data.market import get_beat_miss_history, get_estimates
-                    from analysis.kpis import extract_kpis
-                    from analysis.calls import analyse_all_calls
                     with st.spinner("Generating pre-earnings brief…"):
-                        bm = get_beat_miss_history(ticker)
-                        ests = get_estimates(ticker)
+                        ests = cached_estimates(ticker)
                         kpi_sums: List[str] = []
                         try:
-                            cd = analyse_all_calls(ticker, n=2)
-                            kpis = extract_kpis(ticker, cd)
-                            kpi_sums = [f"{k.kpi_name}: {k.trend_note}" for k in kpis]
+                            if call_data.get("transcripts"):
+                                from analysis.kpis import extract_kpis
+                                kpis = extract_kpis(ticker, call_data)
+                                kpi_sums = [f"{k.kpi_name}: {k.trend_note}" for k in kpis]
                         except Exception:
                             pass
                         brief = build_pre_earnings_brief(ticker, fund, bm, ests, kpi_sums)
@@ -145,28 +184,13 @@ def tab_overview(ticker: str, settings: Dict) -> None:
     st.markdown("**State of play**")
     sop_key = f"sop_{ticker}"
     if sop_key not in st.session_state:
-        # Gather light context — skip analyses that are slow; they cache anyway
-        dcf_for_sop = None
-        quality_for_sop = None
-        sentiment_trend_for_sop: List[float] = []
-        try:
-            dcf_for_sop = reverse_dcf(ticker)
-        except Exception:
-            pass
-        try:
-            quality_for_sop = get_quality_panel(ticker)
-        except Exception:
-            pass
-        try:
-            call_data = analyse_all_calls(ticker, n=4)
-            from analysis.sentiment import aggregate_sentiment_scores
-            sentiment_trend_for_sop = aggregate_sentiment_scores(call_data.get("sentiments", []))
-            sentiment_trend_for_sop = [s for s in sentiment_trend_for_sop if s is not None]
-        except Exception:
-            pass
+        sentiment_trend_for_sop: List[float] = aggregate_sentiment_scores(
+            call_data.get("sentiments", [])
+        )
+        sentiment_trend_for_sop = [s for s in sentiment_trend_for_sop if s is not None]
         sop_container = st.empty()
         try:
-            sop_iter = stream_state_of_play(ticker, fund, dcf_for_sop, sentiment_trend_for_sop, quality_for_sop)
+            sop_iter = stream_state_of_play(ticker, fund, dcf_for_sop, sentiment_trend_for_sop, quality)
             sop_text = streaming_container(sop_iter, sop_container)
             st.session_state[sop_key] = sop_text
         except Exception as exc:
@@ -176,27 +200,18 @@ def tab_overview(ticker: str, settings: Dict) -> None:
 
     st.divider()
 
-    # ── 5. Metrics grid (3×3) ─────────────────────────────────────────────────
-    # Load quality flags for grid (cached)
-    quality = None
-    try:
-        quality = get_quality_panel(ticker)
-    except Exception:
-        pass
-
-    # Load ratio history for P/E median
+    # ── 5. Metrics grid ──────────────────────────────────────────────────────
+    # Extract P/E and EV/EBITDA medians from pre-fetched ratio groups
     pe_median = None
     ev_ebitda_median = None
     try:
-        from analysis.ratios import get_ratio_groups, _fetch_annual_data, _year_end_prices, _valuation_group
-        _data = _fetch_annual_data(ticker)
-        _yp = _year_end_prices(ticker)
-        _vg = _valuation_group(fund, _data, _yp)
-        for r in _vg.ratios:
-            if r.name == "P/E (TTM)":
-                pe_median = r.median_5y
-            elif r.name == "EV/EBITDA":
-                ev_ebitda_median = r.median_5y
+        valuation_rg = next((g for g in ratio_groups if g.group == "Valuation"), None)
+        if valuation_rg:
+            for r in valuation_rg.ratios:
+                if r.name == "P/E (TTM)":
+                    pe_median = r.median_5y
+                elif r.name == "EV/EBITDA":
+                    ev_ebitda_median = r.median_5y
     except Exception:
         pass
 
@@ -266,7 +281,6 @@ def tab_overview(ticker: str, settings: Dict) -> None:
 
     # ── 6. Sentiment sparkline ────────────────────────────────────────────────
     try:
-        call_data = analyse_all_calls(ticker, n=4)
         transcripts = call_data.get("transcripts", [])
         sentiments = call_data.get("sentiments", [])
         if transcripts and sentiments:
@@ -286,9 +300,6 @@ def tab_overview(ticker: str, settings: Dict) -> None:
     # ── 7. Earnings beat/miss tracker ─────────────────────────────────────────
     st.markdown("**Earnings beat/miss — last 8 quarters**")
     try:
-        from data.market import get_beat_miss_history
-        from ui.charts import eps_surprise_bars
-        bm = get_beat_miss_history(ticker)
         if bm:
             valid = [r for r in bm if r.get("eps_surprise_pct") is not None]
             beats = sum(1 for r in valid if (r["eps_surprise_pct"] or 0) >= 0)
@@ -310,30 +321,31 @@ def tab_overview(ticker: str, settings: Dict) -> None:
 
     st.divider()
 
-    # ── 9. High-materiality news ──────────────────────────────────────────────
+    # ── 8. High-materiality news ──────────────────────────────────────────────
     st.markdown("**High-materiality news**")
     try:
-        impacts = classify_headlines(ticker, fund.name or ticker)
-        hi = high_materiality(impacts)
+        hi = high_materiality(impacts_for_news)
         if hi:
             for item in hi[:5]:
                 dir_marker = "+" if item.direction == "positive" else "-" if item.direction == "negative" else "·"
                 url = item.url or "#"
-                st.markdown(
-                    f"`{dir_marker} {item.category}` [{item.title}]({url})",
-                )
+                st.markdown(f"`{dir_marker} {item.category}` [{item.title}]({url})")
                 st.caption(item.one_line_why)
         else:
-            st.caption(f"No high-materiality news in the last 30 days ({len(impacts)} items classified).")
+            st.caption(f"No high-materiality news in the last 30 days ({len(impacts_for_news)} items classified).")
     except Exception as exc:
         error_card("News unavailable", str(exc))
 
+    # Timing caption — only on first (cold) load
+    if elapsed_data > 0.5:
+        st.caption(f"Data fetched in {elapsed_data:.1f}s")
+
 
 def tab_financials(ticker: str, settings: Dict) -> None:
-    from analysis.ratios import get_ratio_groups
     from analysis.reconcile import get_reconciliation
     from ui.charts import price_candlestick, ratio_sparkline, revenue_bars
     from ui.components import error_card, freshness_badge
+    from ui.stcache import cached_prices, cached_ratio_groups
     import plotly.graph_objects as go
 
     col_price, col_recon = st.columns([3, 2])
@@ -341,9 +353,9 @@ def tab_financials(ticker: str, settings: Dict) -> None:
     with col_price:
         st.subheader("Price History")
         try:
-            from data.market import get_prices
             period = st.radio("Period", ["1y", "3y", "5y"], horizontal=True, key="price_period")
-            prices = get_prices(ticker, period)
+            with st.spinner("Loading price data…"):
+                prices = cached_prices(ticker, period)
             fig = price_candlestick(prices, f"{ticker} — {period}")
             st.plotly_chart(fig, use_container_width=True)
             freshness_badge(f"market:{ticker}:prices:{period}", "Prices")
@@ -376,7 +388,7 @@ def tab_financials(ticker: str, settings: Dict) -> None:
     st.subheader("Ratio Groups")
     try:
         with st.spinner("Computing ratio history (fetching 5yr data)…"):
-            groups = get_ratio_groups(ticker)
+            groups = cached_ratio_groups(ticker)
         for group in groups:
             with st.expander(f"**{group.group}**", expanded=(group.group == "Valuation")):
                 cols = st.columns(min(3, len(group.ratios)))
@@ -398,17 +410,18 @@ def tab_financials(ticker: str, settings: Dict) -> None:
 
 
 def tab_earnings_calls(ticker: str, settings: Dict) -> None:
-    from analysis.calls import analyse_all_calls, stream_call_synthesis
+    from analysis.calls import stream_call_synthesis
     from analysis.sentiment import aggregate_sentiment_scores, prepared_qa_gap, sentiment_label
     from ui.charts import sentiment_trend_chart, beat_miss_chart
     from ui.components import error_card, freshness_badge, streaming_container, unavailable_tab
+    from ui.stcache import cached_calls
     from data.resilience import SourceUnavailable
 
     from data.transcripts import TranscriptRateLimited
 
     try:
-        with st.spinner("Loading transcripts + running Pass A/B…"):
-            call_data = analyse_all_calls(ticker, n=4)
+        with st.spinner("Loading transcripts + running Pass A/B (cached if available)…"):
+            call_data = cached_calls(ticker, n=4)
     except SourceUnavailable as exc:
         unavailable_tab("Earnings Calls", str(exc))
         return
@@ -503,14 +516,13 @@ def tab_earnings_calls(ticker: str, settings: Dict) -> None:
 
 
 def tab_news(ticker: str, settings: Dict) -> None:
-    from analysis.news_impact import classify_headlines
-    from data.market import get_fundamentals
     from ui.components import error_card, freshness_badge
+    from ui.stcache import cached_fundamentals, cached_headlines
 
     try:
-        fund = get_fundamentals(ticker)
-        with st.spinner("Classifying headlines…"):
-            impacts = classify_headlines(ticker, fund.name or ticker)
+        fund = cached_fundamentals(ticker)
+        with st.spinner("Classifying headlines (cached if available)…"):
+            impacts = cached_headlines(ticker, fund.name or ticker)
     except Exception as exc:
         error_card("News tab error", str(exc))
         return
@@ -539,12 +551,12 @@ def tab_news(ticker: str, settings: Dict) -> None:
 
 
 def tab_analyst_mode(ticker: str, settings: Dict) -> None:
-    from analysis.expectations import reverse_dcf
     from analysis.kpis import extract_kpis
-    from analysis.quality import get_quality_panel
-    from analysis.positioning import get_positioning
-    from analysis.calls import analyse_all_calls
     from ui.components import error_card, freshness_badge
+    from ui.stcache import (
+        cached_calls, cached_estimates, cached_fundamentals,
+        cached_positioning, cached_quality_panel, cached_reverse_dcf,
+    )
     import plotly.graph_objects as go
     import plotly.express as px
 
@@ -577,11 +589,10 @@ def tab_analyst_mode(ticker: str, settings: Dict) -> None:
                    f"Horizon: {horizon} years")
         try:
             from ui.charts import dcf_contour_heatmap
-            from data.market import get_fundamentals as _get_fund
             import pandas as pd
 
-            with st.spinner("Computing DCF grid…"):
-                dcf = reverse_dcf(
+            with st.spinner("Computing DCF grid (cached if available)…"):
+                dcf = cached_reverse_dcf(
                     ticker,
                     discount_rate=discount_rate,
                     terminal_growth=terminal_growth,
@@ -589,7 +600,7 @@ def tab_analyst_mode(ticker: str, settings: Dict) -> None:
                 )
             if dcf:
                 st.info(dcf.headline)
-                fund_dcf = _get_fund(ticker)
+                fund_dcf = cached_fundamentals(ticker)
                 if fund_dcf.revenue_ttm and fund_dcf.revenue_ttm > 0:
                     fig = dcf_contour_heatmap(dcf, fund_dcf.revenue_ttm)
                     st.plotly_chart(fig, use_container_width=True)
@@ -609,9 +620,8 @@ def tab_analyst_mode(ticker: str, settings: Dict) -> None:
     with sub_tabs[1]:
         st.subheader("EPS Beat/Miss History")
         try:
-            from data.market import get_estimates
             import pandas as pd
-            estimates = get_estimates(ticker)
+            estimates = cached_estimates(ticker)
             eh = estimates.get("earnings_history")
             if eh:
                 df = pd.DataFrame(eh)
@@ -640,7 +650,7 @@ def tab_analyst_mode(ticker: str, settings: Dict) -> None:
     with sub_tabs[2]:
         st.subheader("Company-Specific KPIs")
         try:
-            call_data = analyse_all_calls(ticker, n=4)
+            call_data = cached_calls(ticker, n=4)
             if not call_data["transcripts"]:
                 st.info("KPI extraction requires earnings transcripts (none available for this ticker).")
             else:
@@ -669,7 +679,7 @@ def tab_analyst_mode(ticker: str, settings: Dict) -> None:
         st.subheader("Quality-of-Earnings Flags")
         try:
             with st.spinner("Computing quality flags (pure math)…"):
-                panel = get_quality_panel(ticker)
+                panel = cached_quality_panel(ticker)
             status_labels = {"green": "OK", "yellow": "WATCH", "red": "FLAG"}
             st.markdown(f"**Overall: {panel.overall.title()}** — {panel.summary}")
             st.divider()
@@ -688,7 +698,7 @@ def tab_analyst_mode(ticker: str, settings: Dict) -> None:
     with sub_tabs[4]:
         st.subheader("Positioning — Short Interest, Insiders, Holders")
         try:
-            pos = get_positioning(ticker)
+            pos = cached_positioning(ticker)
             st.info(pos.synthesis)
             c1, c2 = st.columns(2)
             c1.metric("Short interest", f"{pos.short_interest_pct_float*100:.1f}%" if pos.short_interest_pct_float else "N/A")
@@ -709,19 +719,19 @@ def tab_analyst_mode(ticker: str, settings: Dict) -> None:
 
 
 def tab_thesis_memo(ticker: str, settings: Dict) -> None:
-    from analysis.calls import analyse_all_calls, synthesize_calls
+    from analysis.calls import synthesize_calls
     from analysis.delta import run_delta
-    from analysis.expectations import reverse_dcf
     from analysis.kpis import extract_kpis
     from analysis.memo import build_memo_object, memo_to_markdown, stream_memo
-    from analysis.positioning import get_positioning
-    from analysis.quality import get_quality_panel
     from analysis.schemas import RunSnapshotData
     from analysis.thesis import get_red_team, stream_theses
-    from data.market import get_fundamentals
     from ui.components import error_card, streaming_container
+    from ui.stcache import (
+        cached_calls, cached_fundamentals, cached_headlines,
+        cached_positioning, cached_quality_panel, cached_reverse_dcf,
+    )
 
-    fund = get_fundamentals(ticker)
+    fund = cached_fundamentals(ticker)
     dcf = None
     call_delta = None
     quality = None
@@ -734,13 +744,13 @@ def tab_thesis_memo(ticker: str, settings: Dict) -> None:
     _tg = st.session_state.get("dcf_terminal_growth", 2.5) / 100.0
     _hz = st.session_state.get("dcf_horizon", 10)
 
-    with st.spinner("Assembling thesis inputs…"):
+    with st.spinner("Assembling thesis inputs (cached if available)…"):
         try:
-            dcf = reverse_dcf(ticker, _dr, _tg, _hz)
+            dcf = cached_reverse_dcf(ticker, _dr, _tg, _hz)
         except Exception:
             pass
         try:
-            call_data = analyse_all_calls(ticker, n=4)
+            call_data = cached_calls(ticker, n=4)
             if call_data["summaries"]:
                 call_delta = synthesize_calls(call_data["summaries"], call_data["sentiments"], ticker)
                 kpis = extract_kpis(ticker, call_data)
@@ -748,16 +758,16 @@ def tab_thesis_memo(ticker: str, settings: Dict) -> None:
         except Exception:
             pass
         try:
-            quality = get_quality_panel(ticker)
+            quality = cached_quality_panel(ticker)
         except Exception:
             pass
         try:
-            positioning = get_positioning(ticker)
+            positioning = cached_positioning(ticker)
         except Exception:
             pass
         try:
-            from analysis.news_impact import classify_headlines, high_materiality
-            impacts = classify_headlines(ticker, fund.name or ticker)
+            from analysis.news_impact import high_materiality
+            impacts = cached_headlines(ticker, fund.name or ticker)
             high_mat_news = [f"{h.title} ({h.one_line_why})" for h in high_materiality(impacts)]
         except Exception:
             pass
@@ -825,7 +835,7 @@ def tab_thesis_memo(ticker: str, settings: Dict) -> None:
             kpis_for_memo = []
             try:
                 from analysis.kpis import extract_kpis
-                call_data = analyse_all_calls(ticker, n=4)
+                call_data = cached_calls(ticker, n=4)
                 kpis_for_memo = extract_kpis(ticker, call_data) if call_data["transcripts"] else []
             except Exception:
                 pass
@@ -958,13 +968,28 @@ def tab_peer_comps(ticker: str, settings: Dict) -> None:
             st.plotly_chart(fig, use_container_width=True, key=f"peer_bar_{ticker}_{field}")
 
 
+def _tab_gate(key: str, label: str, fn, *args, **kwargs) -> None:
+    """Lazy tab: show a Load button on first visit, then render the full tab content."""
+    loaded_key = f"_gate_{key}"
+    if loaded_key not in st.session_state:
+        st.write("")
+        st.caption(f"**{label}** loads on demand to keep the initial page fast.")
+        if st.button(f"Load {label} →", key=f"_gate_btn_{key}", type="primary"):
+            st.session_state[loaded_key] = True
+            st.rerun()
+    else:
+        t0 = time.perf_counter()
+        fn(*args, **kwargs)
+        _record_timing(key, time.perf_counter() - t0)
+
+
 def run_ticker_mode(ticker: str, settings: Dict) -> None:
-    from data.market import get_fundamentals
+    from ui.stcache import cached_fundamentals
     from ui.components import cost_footer
 
     # Brief header
     try:
-        fund = get_fundamentals(ticker)
+        fund = cached_fundamentals(ticker)
         price = fund.current_price
         price_str = f" · ${price:.2f}" if price else ""
         st.markdown(f"## {fund.name or ticker} ({ticker}){price_str}")
@@ -985,13 +1010,13 @@ def run_ticker_mode(ticker: str, settings: Dict) -> None:
     with tabs[0]:
         tab_overview(ticker, settings)
     with tabs[1]:
-        tab_financials(ticker, settings)
+        _tab_gate(f"financials_{ticker}", "Financials", tab_financials, ticker, settings)
     with tabs[2]:
-        tab_earnings_calls(ticker, settings)
+        _tab_gate(f"calls_{ticker}", "Earnings Calls", tab_earnings_calls, ticker, settings)
     with tabs[3]:
-        tab_news(ticker, settings)
+        _tab_gate(f"news_{ticker}", "News", tab_news, ticker, settings)
     with tabs[4]:
-        tab_analyst_mode(ticker, settings)
+        _tab_gate(f"analyst_{ticker}", "Analyst Mode", tab_analyst_mode, ticker, settings)
     with tabs[5]:
         tab_peer_comps(ticker, settings)
     with tabs[6]:
@@ -1472,6 +1497,34 @@ def main() -> None:
     st.divider()
     with st.expander("Session cost & cache", expanded=False):
         st.checkbox("Force refresh (bypass cache)", value=False, key="force_refresh")
+
+        # Timing report
+        timings = st.session_state.get("_timings", {})
+        if timings:
+            st.markdown("**Load timings (this session):**")
+            cols = st.columns(3)
+            for i, (key, elapsed) in enumerate(sorted(timings.items())):
+                label = key.replace("overview_data_", "overview:").replace("_", " ")
+                speed = "fast" if elapsed < 0.5 else "slow" if elapsed > 5 else "ok"
+                cols[i % 3].metric(label, f"{elapsed:.2f}s", delta=speed)
+
+        # Cache management
+        if st.button("Clear in-memory cache", key="clear_stcache"):
+            from ui.stcache import (
+                cached_fundamentals, cached_prices, cached_short_interest,
+                cached_beat_miss, cached_estimates, cached_quality_panel,
+                cached_calls, cached_ratio_groups, cached_headlines,
+                cached_reverse_dcf, cached_positioning, cached_kpis,
+            )
+            for fn in [
+                cached_fundamentals, cached_prices, cached_short_interest,
+                cached_beat_miss, cached_estimates, cached_quality_panel,
+                cached_calls, cached_ratio_groups, cached_headlines,
+                cached_reverse_dcf, cached_positioning, cached_kpis,
+            ]:
+                fn.clear()
+            st.success("In-memory cache cleared — next data fetch re-reads from SQLite.")
+
         from ui.components import cost_footer
         cost_footer(st.session_state["session_id"])
 
