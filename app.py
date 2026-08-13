@@ -1494,7 +1494,7 @@ def tab_product_deep_dive(url: str, domain: str) -> None:
 
 def _sidebar_nav() -> None:
     """Sidebar mode switcher. Defensive — a bad query param never crashes the nav."""
-    from ui.modes import Mode, detect, display_labels, from_label, label_index, LABELS
+    from ui.modes import Mode, detect, display_labels, from_label, label_index
 
     view = st.query_params.get("view", "")
     has_tickers = "tickers" in st.query_params
@@ -1514,9 +1514,7 @@ def _sidebar_nav() -> None:
         return
 
     st.query_params.clear()
-    if chosen == Mode.BATCH:
-        st.query_params["tickers"] = ""
-    elif chosen == Mode.PORTFOLIO:
+    if chosen == Mode.PORTFOLIO:
         st.query_params["view"] = "portfolio"
     st.rerun()
 
@@ -1544,11 +1542,6 @@ def main() -> None:
     if view == "portfolio":
         from ui.portfolio_ui import render_portfolio_page
         render_portfolio_page()
-        return
-
-    if "tickers" in st.query_params:
-        from ui.batch_ui import render_batch_page
-        render_batch_page()
         return
 
     settings = {
