@@ -1453,6 +1453,12 @@ def main() -> None:
     from ui.components import inject_design_css
     inject_design_css()
 
+    # NEW: Multi-ticker batch mode
+    if "tickers" in st.query_params:
+        from ui.batch_ui import render_batch_page
+        render_batch_page()
+        return  # Don't render the single-ticker page
+
     settings = {
         "force_refresh": st.session_state.get("force_refresh", False),
     }
