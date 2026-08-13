@@ -1453,6 +1453,12 @@ def main() -> None:
     from ui.components import inject_design_css
     inject_design_css()
 
+    # NEW: Portfolio mode
+    if "view" in st.query_params and st.query_params["view"] == "portfolio":
+        from ui.portfolio_ui import render_portfolio_page
+        render_portfolio_page()
+        return
+
     # NEW: Multi-ticker batch mode
     if "tickers" in st.query_params:
         from ui.batch_ui import render_batch_page
