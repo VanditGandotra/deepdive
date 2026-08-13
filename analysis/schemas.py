@@ -1,10 +1,11 @@
 """All Pydantic v2 data models for DeepDive."""
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date, datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -158,6 +159,14 @@ class BusinessProfile(BaseModel):
 # Earnings Calls
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class EarningsSignal(BaseModel):
+    topic: str                                   # e.g. "Revenue guidance", "Gross margin"
+    signal: Literal["positive", "neutral", "negative"]
+    confidence: Literal["high", "medium", "low"] = "medium"
+    evidence: str = ""                           # brief quote or paraphrase (≤ 30 words)
+    rationale: str = ""                          # why positive/neutral/negative vs prior expectations
+
+
 class GuidanceItem(BaseModel):
     metric: str
     value: Optional[str] = None
@@ -176,6 +185,21 @@ class CallSummary(BaseModel):
     notable_quotes_paraphrased: List[str] = []
     one_time_items_mentioned: Optional[str] = None
     competitive_mentions: List[CompetitiveMention] = []
+    signals: List[EarningsSignal] = []
+    signal_overall: Literal["positive", "neutral", "negative"] = "neutral"
+
+    @model_validator(mode="after")
+    def _derive_signal_overall(self) -> "CallSummary":
+        if not self.signals:
+            return self
+        counts: Counter = Counter(s.signal for s in self.signals)
+        top_signal, top_count = counts.most_common(1)[0]
+        # Require strict majority; ties → neutral
+        if top_count > len(self.signals) / 2:
+            self.signal_overall = top_signal
+        else:
+            self.signal_overall = "neutral"
+        return self
 
 class EvasivenessFlag(BaseModel):
     analyst_question_topic: str

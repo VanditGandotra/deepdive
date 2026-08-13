@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 _SYSTEM_EXTRACT = llm.cached_system("""
 You are a financial analyst extracting structured data from earnings call transcripts.
 Extract ONLY what is explicitly stated. Do NOT infer or estimate.
+
 For guidance items, capture exact wording. Mark direction as:
   raised=management explicitly raised prior guidance
   lowered=management explicitly lowered prior guidance
@@ -23,6 +24,19 @@ For guidance items, capture exact wording. Mark direction as:
   initiated=new guidance item this quarter
   withdrawn=guidance was pulled with no replacement
   n/a=not applicable or direction unclear
+
+For signals (5–8 items covering key topics discussed), assess each RELATIVE TO PRIOR EXPECTATIONS —
+meaning relative to consensus estimates, management's own prior guidance, or the market's implied
+trajectory. A beat vs expectations is "positive" even if the metric declined year-over-year. A
+miss vs expectations is "negative" even if the metric grew.
+
+signal="positive": result/commentary explicitly beat expectations or management raised outlook vs prior
+signal="neutral":  in-line with expectations, or directionally mixed with no clear net surprise
+signal="negative": missed expectations or management cut/withdrew guidance vs prior
+
+confidence: "high" if supported by explicit numbers, "medium" if directional language only, "low" if speculative
+evidence: brief direct quote or paraphrase (max 30 words)
+rationale: one sentence explaining why positive/neutral/negative vs prior expectations
 """)
 
 _SYSTEM_SENTIMENT = llm.cached_system("""
@@ -62,7 +76,10 @@ def extract_call_summary(transcript: Dict) -> Optional[CallSummary]:
                 *llm.cached_content(f"<transcript id=\"{tag}\">\n{content[:25000]}\n</transcript>"),
                 llm.text_block(
                     f"Extract the CallSummary for {quarter_label}. "
-                    "Set quarter field to the quarter label shown above."
+                    "Set quarter field to the quarter label shown above. "
+                    "Include 5–8 signals covering the most important topics discussed "
+                    "(revenue, margins, guidance, demand, key metrics). "
+                    "Assess each signal relative to prior expectations, not year-over-year change."
                 ),
             ],
         }

@@ -409,6 +409,38 @@ def tab_financials(ticker: str, settings: Dict) -> None:
         error_card("Ratio engine error", str(exc))
 
 
+_SIGNAL_DOT = {
+    "positive": ("🟢", "Positive"),
+    "neutral":  ("⚪", "Neutral"),
+    "negative": ("🔴", "Negative"),
+}
+_SIGNAL_CONF_COLOR = {"high": "#2ecc71", "medium": "#f39c12", "low": "#95a5a6"}
+
+
+def _render_signal_scorecard(summary) -> None:
+    """Render EarningsSignal list as an accessibility-safe scorecard (dot + label)."""
+    if not summary.signals:
+        return
+    overall_dot, overall_label = _SIGNAL_DOT.get(summary.signal_overall, ("⚪", "Neutral"))
+    st.markdown(f"**Signal Scorecard** — overall: {overall_dot} {overall_label}")
+    for sig in summary.signals:
+        dot, label = _SIGNAL_DOT.get(sig.signal, ("⚪", "Neutral"))
+        conf_color = _SIGNAL_CONF_COLOR.get(sig.confidence, "#95a5a6")
+        with st.container():
+            cols = st.columns([1, 6])
+            with cols[0]:
+                st.markdown(f"{dot} **{label}**")
+            with cols[1]:
+                conf_badge = f'<span style="font-size:0.75rem;color:{conf_color}">[{sig.confidence}]</span>'
+                st.markdown(
+                    f"**{sig.topic}** {conf_badge}<br>"
+                    f"<span style='font-size:0.85rem'>{sig.rationale}</span><br>"
+                    f"<span style='font-size:0.8rem;color:#888'>{sig.evidence}</span>",
+                    unsafe_allow_html=True,
+                )
+    st.divider()
+
+
 def tab_earnings_calls(ticker: str, settings: Dict) -> None:
     from analysis.calls import stream_call_synthesis
     from analysis.sentiment import aggregate_sentiment_scores, prepared_qa_gap, sentiment_label
@@ -461,6 +493,7 @@ def tab_earnings_calls(ticker: str, settings: Dict) -> None:
     for i, (col, summary, sentiment) in enumerate(zip(col_tabs, summaries, sentiments)):
         with col:
             if summary:
+                _render_signal_scorecard(summary)
                 st.markdown("**Key Themes**")
                 for theme in summary.key_themes:
                     st.markdown(f"- {theme}")
