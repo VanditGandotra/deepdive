@@ -78,7 +78,7 @@ class TickerAnalysis(BaseModel):
         # Derive implied_return per scenario
         if self.current_price and self.current_price > 0:
             for s in self.scenarios:
-                if s.price_target is not None:
+                if s.price_target is not None and s.price_target >= 0:
                     s.implied_return = (s.price_target / self.current_price) - 1.0
         # Derive expected returns
         self._compute_expected_returns()
@@ -88,12 +88,17 @@ class TickerAnalysis(BaseModel):
         if not self.scenarios or not self.current_price:
             return
         for horizon in [1, 3, 5]:
-            weighted = 0.0
-            for s in self.scenarios:
-                if s.implied_return is not None:
-                    # annualize: (1 + total_return)^(1/horizon) - 1
-                    annual = (1 + s.implied_return) ** (1.0 / horizon) - 1.0
-                    weighted += s.probability * annual
+            valid = [(s.probability, s.implied_return) for s in self.scenarios if s.implied_return is not None]
+            if not valid:
+                continue
+            total_p = sum(p for p, _ in valid)
+            if total_p <= 0:
+                continue
+            weighted = sum(
+                (p / total_p) * ((1 + r) ** (1.0 / horizon) - 1.0)
+                for p, r in valid
+                if r > -1.0  # guard against complex number from fractional power of negative
+            )
             if horizon == 1:
                 self.expected_return_1y = round(weighted, 6)
             elif horizon == 3:

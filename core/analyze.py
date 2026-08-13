@@ -10,6 +10,62 @@ from core.cache import get_cached_analysis, save_analysis, ANALYSIS_VERSION
 
 logger = logging.getLogger(__name__)
 
+
+def _rehydrate(analysis: TickerAnalysis) -> TickerAnalysis:
+    """Re-hydrate Any-typed sub-model fields after JSON round-trip."""
+    from analysis.schemas import (
+        Fundamentals, ReverseDCFResult, CallDelta, QualityPanel,
+        PositioningSummary, HeadlineImpact, KpiSeries,
+    )
+    if isinstance(analysis.fundamentals, dict):
+        try:
+            analysis.fundamentals = Fundamentals.model_validate(analysis.fundamentals)
+        except Exception:
+            pass
+    if isinstance(analysis.dcf, dict):
+        try:
+            analysis.dcf = ReverseDCFResult.model_validate(analysis.dcf)
+        except Exception:
+            pass
+    if isinstance(analysis.call_delta, dict):
+        try:
+            analysis.call_delta = CallDelta.model_validate(analysis.call_delta)
+        except Exception:
+            pass
+    if isinstance(analysis.quality, dict):
+        try:
+            analysis.quality = QualityPanel.model_validate(analysis.quality)
+        except Exception:
+            pass
+    if isinstance(analysis.positioning, dict):
+        try:
+            analysis.positioning = PositioningSummary.model_validate(analysis.positioning)
+        except Exception:
+            pass
+    if analysis.headlines:
+        hydrated = []
+        for h in analysis.headlines:
+            if isinstance(h, dict):
+                try:
+                    hydrated.append(HeadlineImpact.model_validate(h))
+                except Exception:
+                    hydrated.append(h)
+            else:
+                hydrated.append(h)
+        analysis.headlines = hydrated
+    if analysis.kpis:
+        hydrated_kpis = []
+        for k in analysis.kpis:
+            if isinstance(k, dict):
+                try:
+                    hydrated_kpis.append(KpiSeries.model_validate(k))
+                except Exception:
+                    hydrated_kpis.append(k)
+            else:
+                hydrated_kpis.append(k)
+        analysis.kpis = hydrated_kpis
+    return analysis
+
 _DEFAULT_CONFIG = {
     "discount_rate": 0.10,
     "terminal_growth": 0.025,
@@ -29,9 +85,9 @@ def analyze_ticker(
     today = as_of or date.today()
 
     # Cache check
-    cached = get_cached_analysis(ticker, today, ANALYSIS_VERSION)
+    cached = get_cached_analysis(ticker, today, ANALYSIS_VERSION, config=cfg)
     if cached is not None:
-        return cached
+        return _rehydrate(cached)
 
     data_gaps: List[str] = []
     sources: List[Source] = []
@@ -203,5 +259,5 @@ def analyze_ticker(
         sources=sources,
     )
 
-    save_analysis(analysis)
+    save_analysis(analysis, config=cfg)
     return analysis
