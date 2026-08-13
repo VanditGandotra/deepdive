@@ -122,7 +122,7 @@ class BatchRunner:
     def is_done(self) -> bool:
         return all(
             s.status in (BatchStatus.DONE, BatchStatus.FAILED, BatchStatus.CANCELLED)
-            for s in self._states.values()
+            for s in self.states.values()
         )
 
     @property
