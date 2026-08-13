@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # ── Singleton client ──────────────────────────────────────────────────────────
 _client: Optional[anthropic.Anthropic] = None
 _client_lock = threading.Lock()
-_session_id: str = ""
+_thread_local = threading.local()
 
 
 def _get_client() -> anthropic.Anthropic:
@@ -40,8 +40,11 @@ def _get_client() -> anthropic.Anthropic:
 
 
 def set_session_id(sid: str) -> None:
-    global _session_id
-    _session_id = sid
+    _thread_local.session_id = sid
+
+
+def _get_session_id() -> str:
+    return getattr(_thread_local, "session_id", "")
 
 
 # ── Cost estimation ───────────────────────────────────────────────────────────
@@ -159,7 +162,7 @@ def call(
     if not skip_llm_cache:
         cached = get_llm_cache(content_hash)
         if cached is not None:
-            log_llm_call(model, prompt_version, content_hash, 0, 0, 0, 0, 0.0, True, _session_id)
+            log_llm_call(model, prompt_version, content_hash, 0, 0, 0, 0, 0.0, True, _get_session_id())
             if schema:
                 try:
                     return schema.model_validate_json(cached)
@@ -193,7 +196,7 @@ def call(
     cost         = estimate_cost(model, tokens_in, tokens_out, cache_read, cache_write)
 
     log_llm_call(model, prompt_version, content_hash, tokens_in, tokens_out,
-                 cache_read, cache_write, cost, False, _session_id)
+                 cache_read, cache_write, cost, False, _get_session_id())
 
     if schema:
         try:
@@ -290,7 +293,7 @@ def _stream(
         cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
         cost        = estimate_cost(model, tokens_in, tokens_out, cache_read, cache_write)
         log_llm_call(model, "stream", "stream", tokens_in, tokens_out,
-                     cache_read, cache_write, cost, False, _session_id)
+                     cache_read, cache_write, cost, False, _get_session_id())
         if final.stop_reason == "max_tokens":
             logger.warning(
                 "Streaming response truncated at max_tokens=%d for model=%s",

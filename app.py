@@ -18,8 +18,8 @@ st.set_page_config(
 # ── Session init ──────────────────────────────────────────────────────────────
 if "session_id" not in st.session_state:
     st.session_state["session_id"] = str(uuid.uuid4())
-    import llm
-    llm.set_session_id(st.session_state["session_id"])
+import llm
+llm.set_session_id(st.session_state["session_id"])
 
 _URL_PATTERN = re.compile(r"(https?://|www\.)|[a-zA-Z0-9-]+\.[a-zA-Z]{2,}")
 _TICKER_PATTERN = re.compile(r"^[A-Z]{1,5}$")

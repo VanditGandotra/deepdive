@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import threading
 import time
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
@@ -23,15 +24,17 @@ _HEADERS = {
 
 _MIN_INTERVAL = 1.0 / WEB_RATE_LIMIT
 _last_req_at: float = 0.0
+_rate_lock = threading.Lock()
 
 
 def _rate_limit() -> None:
     global _last_req_at
-    now = time.monotonic()
-    wait = _MIN_INTERVAL - (now - _last_req_at)
-    if wait > 0:
-        time.sleep(wait)
-    _last_req_at = time.monotonic()
+    with _rate_lock:
+        now = time.monotonic()
+        wait = _MIN_INTERVAL - (now - _last_req_at)
+        if wait > 0:
+            time.sleep(wait)
+        _last_req_at = time.monotonic()
 
 
 def _safe_get(url: str, timeout: int = 12) -> Optional[httpx.Response]:
