@@ -52,3 +52,4 @@ evals/reports/
 
 # Streamlit secrets (if used instead of .env)
 .streamlit/secrets.toml
+.worktrees/
