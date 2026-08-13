@@ -1596,8 +1596,29 @@ def main() -> None:
         return
 
     if view == "ticker":
-        from ui.ticker_drillthrough_ui import render_ticker_drillthrough_page
-        render_ticker_drillthrough_page()
+        symbol = st.query_params.get("symbol", "").upper().strip()
+        if not symbol:
+            st.warning("No symbol specified. Go back and select a holding.")
+            if st.button("← Back", key="ticker_view__back_nosymbol"):
+                st.query_params.clear()
+                st.rerun()
+            return
+        # Back button — returns to portfolio without clearing the optimizer result.
+        referer = st.query_params.get("from", "")
+        if referer == "portfolio" or "portfolio" in st.query_params:
+            portfolio_name = st.query_params.get("portfolio", "")
+            if st.button("← Back to portfolio", key="ticker_view__back_to_portfolio"):
+                for k in ["view", "symbol", "from"]:
+                    st.query_params.pop(k, None)
+                if portfolio_name:
+                    st.query_params["view"] = "portfolio"
+                st.rerun()
+        else:
+            if st.button("← Back", key="ticker_view__back"):
+                st.query_params.clear()
+                st.rerun()
+        settings = {"force_refresh": st.session_state.get("force_refresh", False)}
+        run_ticker_mode(symbol, settings)
         return
 
     # Top-level modes

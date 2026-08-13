@@ -285,10 +285,12 @@ def _render_scenario_cards_section(tickers: list[str]) -> None:
                             with col:
                                 _scenario_card(scenario, analysis.current_price)
 
-                    if st.button(
+                    portfolio_name = st.query_params.get("portfolio", "")
+                    drill_url = f"?view=ticker&symbol={ticker}&from=portfolio"
+                    if portfolio_name:
+                        drill_url += f"&portfolio={portfolio_name}"
+                    st.link_button(
                         f"Drill into {ticker} →",
-                        key=f"portfolio_analysis__drill__{ticker}",
-                    ):
-                        st.query_params["view"] = "ticker"
-                        st.query_params["symbol"] = ticker
-                        st.rerun()
+                        url=drill_url,
+                        help="Opens in this tab. Cmd-click (Mac) or Ctrl-click (Win) to open in a new tab.",
+                    )

@@ -26,7 +26,6 @@ IMPORTABLE_MODULES = [
     "ui.modes",
     "ui.portfolio_ui",
     "ui.portfolio_analysis_ui",
-    "ui.ticker_drillthrough_ui",
     # cli
     "cli.batch",
 ]

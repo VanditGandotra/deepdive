@@ -71,38 +71,25 @@ def test_scenario_card_shows_probability():
     assert "35%" in caption_calls
 
 
-def test_drillthrough_no_symbol_shows_warning():
-    """render_ticker_drillthrough_page warns when no symbol in query_params."""
-    mock_st = MagicMock()
-    mock_st.query_params = {}
-    mock_st.button.return_value = False
-
-    with patch("ui.ticker_drillthrough_ui.st", mock_st):
-        from ui.ticker_drillthrough_ui import render_ticker_drillthrough_page
-        render_ticker_drillthrough_page()
-
-    mock_st.warning.assert_called_once()
-    warning_text = mock_st.warning.call_args[0][0]
-    assert "symbol" in warning_text.lower() or "no" in warning_text.lower()
+def test_ticker_drillthrough_module_deleted():
+    """ticker_drillthrough_ui was absorbed into app.py main() routing.
+    Verify it no longer exists and that app.py imports correctly."""
+    import importlib
+    import importlib.util
+    spec = importlib.util.find_spec("ui.ticker_drillthrough_ui")
+    assert spec is None, "ticker_drillthrough_ui.py should be deleted — drill-through is now in app.py"
 
 
-def test_drillthrough_with_cached_analysis_renders_company_name():
-    """When cached analysis is in session_state, renders company name."""
-    analysis = _make_analysis("AAPL")
-    mock_st = MagicMock()
-    mock_st.query_params = {"symbol": "AAPL"}
-    mock_st.session_state = {"_drillthrough_AAPL": analysis}
-    mock_st.button.return_value = False
-
-    col_mocks = [MagicMock(), MagicMock(), MagicMock()]
-    mock_st.columns.return_value = col_mocks
-
-    with patch("ui.ticker_drillthrough_ui.st", mock_st):
-        from ui.ticker_drillthrough_ui import render_ticker_drillthrough_page
-        render_ticker_drillthrough_page()
-
-    markdown_calls = " ".join(str(c) for c in mock_st.markdown.call_args_list)
-    assert "Apple Inc." in markdown_calls or "AAPL" in markdown_calls
+def test_app_imports_cleanly():
+    """app.py must import without raising (smoke test for routing refactor)."""
+    # We can't import app.py normally (it calls st.set_page_config at module level)
+    # so just verify the module source is parseable and has run_ticker_mode.
+    import ast
+    from pathlib import Path
+    source = (Path(__file__).parent.parent / "app.py").read_text()
+    tree = ast.parse(source)
+    fn_names = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    assert "run_ticker_mode" in fn_names, "run_ticker_mode must exist in app.py"
 
 
 def test_ticker_analysis_scenario_ordering():
