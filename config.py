@@ -17,6 +17,7 @@ API_NINJAS_PREMIUM = os.getenv("API_NINJAS_PREMIUM", "").lower() == "true"
 ROIC_API_KEY = os.getenv("ROIC_API_KEY", "")
 FMP_API_KEY = os.getenv("FMP_API_KEY", "")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+PRODUCT_HUNT_TOKEN = os.getenv("PRODUCT_HUNT_TOKEN", "")
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
 EDGAR_USER_AGENT = os.getenv("EDGAR_USER_AGENT", "DeepDive Research vandit@deductive.ai")
 

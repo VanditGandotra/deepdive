@@ -132,6 +132,8 @@ def call(
     max_tokens: int = 4096,
     temperature: float = 0.0,
     skip_llm_cache: bool = False,
+    continue_on_truncation: bool = False,
+    max_continuations: int = 3,
 ) -> Any:
     """
     Unified LLM call entry point.
@@ -140,6 +142,9 @@ def call(
             list → passed as-is (use cached_system() to add cache_control)
     schema: Type[BaseModel] → structured output via tool use
     mode:   "realtime" | "stream" | "batch"
+    continue_on_truncation: when True, auto-continues if stop_reason=="max_tokens"
+                            (text-only non-streaming calls only). Truncated
+                            responses are NOT written to the LLM cache.
     """
     if mode == "stream":
         return _stream(model, messages, system=system, max_tokens=max_tokens, temperature=temperature)
@@ -204,10 +209,45 @@ def call(
         value_str = result.model_dump_json()
         set_llm_cache(content_hash, value_str)
         return result
-    else:
-        text = "".join(b.text for b in response.content if b.type == "text")
+
+    # ── text response with optional auto-continuation ─────────────────────────
+    text = "".join(b.text for b in response.content if b.type == "text")
+    stop_reason = response.stop_reason
+
+    if continue_on_truncation and stop_reason == "max_tokens":
+        logger.warning(
+            "Response truncated (max_tokens=%d) for model=%s — continuing (up to %d times)",
+            max_tokens, model, max_continuations,
+        )
+        cont_messages = list(messages) + [
+            {"role": "assistant", "content": text},
+            {"role": "user", "content": [text_block("Please continue from where you left off.")]},
+        ]
+        for i in range(max_continuations):
+            cont_kwargs = {**kwargs, "messages": cont_messages}
+            cont_resp = client.messages.create(**cont_kwargs)
+            cont_text = "".join(b.text for b in cont_resp.content if b.type == "text")
+            text += cont_text
+            stop_reason = cont_resp.stop_reason
+            if stop_reason != "max_tokens":
+                break
+            logger.warning("Still truncated after continuation %d/%d", i + 1, max_continuations)
+            cont_messages = cont_messages + [
+                {"role": "assistant", "content": cont_text},
+                {"role": "user", "content": [text_block("Please continue.")]},
+            ]
+        if stop_reason == "max_tokens":
+            logger.error("Response still truncated after %d continuations", max_continuations)
+
+    if stop_reason == "end_turn":
         set_llm_cache(content_hash, text)
-        return text
+    else:
+        logger.warning(
+            "NOT caching response with stop_reason=%s (model=%s, prompt_version=%s)",
+            stop_reason, model, prompt_version,
+        )
+
+    return text
 
 
 # ── Streaming ─────────────────────────────────────────────────────────────────
@@ -228,7 +268,10 @@ def _stream(
     max_tokens: int = 4096,
     temperature: float = 0.0,
 ) -> Iterator[str]:
-    """Yields text tokens. Logs usage after stream completes."""
+    """Yields text tokens. Logs usage after stream completes.
+    If stop_reason is 'max_tokens', emits a visible truncation marker instead of
+    silently cutting off mid-sentence.
+    """
     client = _get_client()
     sys_param = _normalise_system(system)
     kwargs: dict = {"model": model, "max_tokens": max_tokens, "messages": messages}
@@ -248,6 +291,16 @@ def _stream(
         cost        = estimate_cost(model, tokens_in, tokens_out, cache_read, cache_write)
         log_llm_call(model, "stream", "stream", tokens_in, tokens_out,
                      cache_read, cache_write, cost, False, _session_id)
+        if final.stop_reason == "max_tokens":
+            logger.warning(
+                "Streaming response truncated at max_tokens=%d for model=%s",
+                max_tokens, model,
+            )
+            yield (
+                "\n\n---\n> ⚠️ **Response truncated** — hit the output token limit "
+                f"({max_tokens} tokens). Increase `max_tokens` in the calling function "
+                "or reduce the input context.\n"
+            )
 
 
 # ── Web search synthesis ─────────────────────────────────────────────────────

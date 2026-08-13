@@ -140,7 +140,7 @@ def stream_company_intel(
         SONNET, messages,
         system=_SYSTEM_SYNTH,
         mode="stream",
-        max_tokens=3000,
+        max_tokens=6000,
     )
     return token_iter, snap
 

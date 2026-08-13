@@ -109,7 +109,7 @@ def stream_memo(
         }
     ]
 
-    token_iter = llm.call(SONNET, messages, system=_SYSTEM, mode="stream", max_tokens=2000)
+    token_iter = llm.call(SONNET, messages, system=_SYSTEM, mode="stream", max_tokens=4000)
     return token_iter, footnotes
 
 

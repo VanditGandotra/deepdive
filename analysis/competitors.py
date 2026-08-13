@@ -1,9 +1,11 @@
-"""Feature 7: Competitive discovery — identify competitors and do a side-by-side feature compare."""
+"""Feature 7: Competitive discovery — identify competitors and side-by-side comparison."""
 from __future__ import annotations
 
+import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import llm
 from config import HAIKU, SONNET, TTL_NEWS, TTL_WEB_PAGES
@@ -12,9 +14,9 @@ from data.cache import get_cache_obj, set_cache_obj
 logger = logging.getLogger(__name__)
 
 _SYSTEM_DISCOVER = llm.cached_system("""
-You are a competitive intelligence analyst. Given a company description, identify its 3-5 closest
+You are a competitive intelligence analyst. Given a company/product, identify its 3-5 closest
 direct competitors. Return ONLY a JSON array of objects with keys:
-  name (company name), domain (website domain, no https://)
+  name (company/product name), domain (website domain, no https://)
 Example: [{"name": "Competitor A", "domain": "competitor-a.com"}, ...]
 No explanation. Only valid JSON array.
 """)
@@ -31,55 +33,83 @@ Be specific — name actual features. Under 500 words.
 """)
 
 
-def discover_competitors(domain: str, company_summary: str) -> List[Dict]:
-    """
-    Use Sonnet to identify 3-5 competitors for the given domain/company.
-    Returns list of {name, domain}.
-    """
-    cache_key = f"competitors:discover:{domain}"
-    cached = get_cache_obj(cache_key)
-    if cached:
-        return cached
+def _domain_to_product_name(domain: str) -> str:
+    bare = domain.split("/")[0].lower()
+    parts = bare.split(".")
+    if parts[0] == "www" and len(parts) > 1:
+        parts = parts[1:]
+    return parts[0].title()
 
-    messages = [
-        {
-            "role": "user",
-            "content": llm.text_block(
-                f"Company: {domain}\n\nDescription:\n{company_summary[:1500]}\n\n"
-                "Identify the 3-5 closest direct competitors. Return JSON array only."
-            ),
-        }
-    ]
+
+def discover_competitors(domain: str, company_summary: str = "") -> Tuple[List[Dict], Dict]:
+    """
+    Identify 3-5 competitors for the given domain using web search + Sonnet.
+    Returns (list of {name, domain}, diag_dict).
+    Does NOT require company_summary — web search covers the gap.
+    """
+    cache_key = f"competitors_v2:discover:{domain}"
+    cached = get_cache_obj(cache_key)
+    if cached is not None:
+        return cached, {"method": "cache"}
+
+    product_name = _domain_to_product_name(domain)
+    diag = {"domain": domain, "product_name": product_name}
+
+    # Step 1: web search to find real competitors by name
+    web_context = llm.web_search_synthesis(
+        f'Who are the main competitors and alternatives to "{product_name}" ({domain})? '
+        f'List the top 3-5 direct competitors with their website domains. '
+        f'Include both established players and newer challengers.',
+        cache_key=f"competitors_v2:search:{domain}",
+        max_tokens=600,
+    )
+    diag["web_search_chars"] = len(web_context)
+    logger.info("[competitors] web_search for %s: %d chars", domain, len(web_context))
+
+    # Step 2: Sonnet structures the result into JSON
+    context_for_llm = web_context or company_summary or f"Product: {product_name} at {domain}"
+    messages = [{
+        "role": "user",
+        "content": llm.text_block(
+            f"Product: {product_name} ({domain})\n\n"
+            f"Research findings:\n{context_for_llm[:2000]}\n\n"
+            "List the 3-5 closest direct competitors. Return JSON array only."
+        ),
+    }]
     try:
-        import json, re
         raw = llm.call(
             SONNET, messages,
             system=_SYSTEM_DISCOVER,
-            prompt_version="v1",
+            prompt_version="v2",
             max_tokens=400,
         )
-        match = re.search(r"\[.*\]", raw, re.DOTALL)
-        result = json.loads(match.group()) if match else []
-        # Validate structure
+        m = re.search(r"\[.*\]", raw, re.DOTALL)
+        result = json.loads(m.group()) if m else []
         result = [r for r in result if isinstance(r, dict) and "domain" in r][:5]
+        diag["competitors_found"] = [r.get("name") for r in result]
     except Exception as exc:
         logger.warning("competitor discovery failed for %s: %s", domain, exc)
         result = []
+        diag["error"] = str(exc)
 
     set_cache_obj(cache_key, result, TTL_WEB_PAGES)
-    return result
+    return result, diag
 
 
-def _crawl_competitor(competitor_domain: str) -> Optional[str]:
-    """Fetch top pages from a competitor and return a short text summary."""
+def _crawl_competitor(competitor_domain: str) -> Tuple[Optional[str], Dict]:
+    """Fetch competitor site. Falls back to web_search if crawl is blocked."""
     from data.webintel import discover_urls, fetch_pages
     from analysis.company import extract_page_intel
 
-    cache_key = f"competitors:crawl:{competitor_domain}"
+    cache_key = f"competitors_v2:crawl:{competitor_domain}"
     cached = get_cache_obj(cache_key)
-    if cached:
-        return cached
+    if cached is not None:
+        return cached, {"method": "cache"}
 
+    product_name = _domain_to_product_name(competitor_domain)
+    diag = {"domain": competitor_domain, "product_name": product_name}
+
+    # Try direct crawl first
     try:
         url = f"https://{competitor_domain}"
         urls = discover_urls(url)[:15]
@@ -90,79 +120,112 @@ def _crawl_competitor(competitor_domain: str) -> Optional[str]:
             if intel:
                 intels.append(intel)
 
-        if not intels:
-            return None
-
-        # Build compact summary
-        features = []
-        for intel in intels:
-            features.extend(intel.feature_claims[:3])
-        customers = list({c for intel in intels for c in intel.named_customers})[:5]
-        summary_parts = [f"Domain: {competitor_domain}"]
-        if features:
-            summary_parts.append("Features: " + "; ".join(features[:8]))
-        if customers:
-            summary_parts.append("Customers: " + ", ".join(customers))
-        result = "\n".join(summary_parts)
-        set_cache_obj(cache_key, result, TTL_WEB_PAGES)
-        return result
+        if intels:
+            features = []
+            for intel in intels:
+                features.extend(intel.feature_claims[:3])
+            customers = list({c for intel in intels for c in intel.named_customers})[:5]
+            parts = [f"Domain: {competitor_domain}"]
+            if features:
+                parts.append("Features: " + "; ".join(features[:8]))
+            if customers:
+                parts.append("Customers: " + ", ".join(customers))
+            result = "\n".join(parts)
+            diag["method"] = "crawl"
+            diag["pages_crawled"] = len(intels)
+            set_cache_obj(cache_key, result, TTL_WEB_PAGES)
+            return result, diag
     except Exception as exc:
-        logger.warning("competitor crawl failed for %s: %s", competitor_domain, exc)
-        return None
+        diag["crawl_error"] = str(exc)
+        logger.debug("competitor crawl failed for %s: %s", competitor_domain, exc)
+
+    # Fallback: web search for competitor info
+    diag["method"] = "web_search_fallback"
+    search_result = llm.web_search_synthesis(
+        f'What does "{product_name}" ({competitor_domain}) do? '
+        f'Key features, pricing, target customers, main differentiators.',
+        cache_key=f"competitors_v2:search_crawl:{competitor_domain}",
+        max_tokens=500,
+    )
+    diag["search_chars"] = len(search_result)
+    logger.info("[competitors] crawl fallback for %s: %d chars", competitor_domain, len(search_result))
+
+    if search_result:
+        result = f"Domain: {competitor_domain}\n{search_result}"
+        set_cache_obj(cache_key, result, TTL_WEB_PAGES)
+        return result, diag
+
+    return None, diag
 
 
 def build_competitive_comparison(
     target_domain: str,
     target_summary: str,
     competitor_list: List[Dict],
-) -> str:
+) -> Tuple[str, List[Dict]]:
     """
     Crawl competitors in parallel and produce a Sonnet comparison narrative.
-    Returns markdown text.
+    Returns (markdown_text, list_of_crawl_diags).
     """
-    cache_key = f"competitors:compare:{target_domain}:{','.join(c.get('domain','') for c in competitor_list)}"
+    cache_key = (
+        f"competitors_v2:compare:{target_domain}:"
+        + ",".join(c.get("domain", "") for c in competitor_list)
+    )
     cached = get_cache_obj(cache_key)
-    if cached:
-        return cached
+    if cached is not None:
+        return cached, []
 
+    product_name = _domain_to_product_name(target_domain)
+    crawl_diags: List[Dict] = []
     competitor_summaries: List[str] = []
+
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(_crawl_competitor, c["domain"]): c for c in competitor_list}
+        futures = {
+            pool.submit(_crawl_competitor, c["domain"]): c
+            for c in competitor_list
+        }
         for fut in as_completed(futures):
             comp = futures[fut]
-            result = fut.result()
+            try:
+                result, diag = fut.result()
+            except Exception as exc:
+                result, diag = None, {"domain": comp.get("domain"), "error": str(exc)}
+            diag["name"] = comp.get("name")
+            crawl_diags.append(diag)
+            logger.info("[competitors] crawl result for %s: %s", comp.get("domain"), diag)
             if result:
                 competitor_summaries.append(
                     f"### {comp.get('name', comp['domain'])}\n{result}"
                 )
 
     if not competitor_summaries:
-        return "Could not fetch competitor data."
+        return "Could not fetch competitor data.", crawl_diags
 
     context = (
-        f"## Target: {target_domain}\n{target_summary[:2000]}\n\n"
+        f"## Target: {product_name} ({target_domain})\n"
+        + (target_summary[:2000] if target_summary else f"See {target_domain}")
+        + "\n\n"
         + "\n\n".join(competitor_summaries)
     )
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                *llm.cached_content(context),
-                llm.text_block(
-                    f"Write the competitive comparison for {target_domain} vs the listed competitors."
-                ),
-            ],
-        }
-    ]
+    messages = [{
+        "role": "user",
+        "content": [
+            *llm.cached_content(context),
+            llm.text_block(
+                f"Write the competitive comparison for {product_name} vs the listed competitors."
+            ),
+        ],
+    }]
     try:
         result = llm.call(
             SONNET, messages,
             system=_SYSTEM_COMPARE,
             prompt_version="v1",
-            max_tokens=1500,
+            max_tokens=3000,
+            continue_on_truncation=True,
         )
         set_cache_obj(cache_key, result, TTL_NEWS)
-        return result
+        return result, crawl_diags
     except Exception as exc:
         logger.warning("competitive compare Sonnet call failed: %s", exc)
-        return "Comparison generation failed."
+        return "Comparison generation failed.", crawl_diags

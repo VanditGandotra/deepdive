@@ -497,10 +497,15 @@ def tab_earnings_calls(ticker: str, settings: Dict) -> None:
     st.divider()
     st.markdown("**What Changed — 4-Quarter Synthesis**")
     if len(transcripts) >= 2:
-        container = st.empty()
-        with st.spinner("Synthesising cross-quarter evolution (Sonnet)…"):
-            synthesis_iter = stream_call_synthesis(summaries, sentiments, ticker)
-            streaming_container(synthesis_iter, container)
+        synthesis_key = f"call_synthesis_{ticker}"
+        if synthesis_key not in st.session_state:
+            container = st.empty()
+            with st.spinner("Synthesising cross-quarter evolution (Sonnet)…"):
+                synthesis_iter = stream_call_synthesis(summaries, sentiments, ticker)
+                text = streaming_container(synthesis_iter, container)
+            st.session_state[synthesis_key] = text
+        else:
+            st.markdown(st.session_state[synthesis_key])
     else:
         st.caption("Need at least 2 quarters for synthesis.")
 
@@ -761,7 +766,12 @@ def tab_thesis_memo(ticker: str, settings: Dict) -> None:
         try:
             call_data = cached_calls(ticker, n=4)
             if call_data["summaries"]:
-                call_delta = synthesize_calls(call_data["summaries"], call_data["sentiments"], ticker)
+                _delta_key = f"call_delta_{ticker}"
+                if _delta_key not in st.session_state:
+                    st.session_state[_delta_key] = synthesize_calls(
+                        call_data["summaries"], call_data["sentiments"], ticker
+                    )
+                call_delta = st.session_state[_delta_key]
                 kpis = extract_kpis(ticker, call_data)
                 kpi_summaries = [f"{k.kpi_name}: {k.trend_note}" for k in kpis]
         except Exception:
@@ -820,7 +830,8 @@ def tab_thesis_memo(ticker: str, settings: Dict) -> None:
     # ── Red team ──────────────────────────────────────────────────────────────
     with redteam_tab:
         st.caption("Devil's advocate: strongest counter-argument to the prevailing thesis.")
-        if st.button("Run Devil's Advocate", type="secondary"):
+        rt_key = f"red_team_{ticker}"
+        if st.button("Run Devil's Advocate", type="secondary", key=f"rt_btn_{ticker}"):
             context = f"Ticker: {ticker}\n{fund.model_dump_json()[:1500]}"
             if call_delta:
                 context += f"\nCall delta: {call_delta.what_changed_narrative[:500]}"
@@ -828,13 +839,17 @@ def tab_thesis_memo(ticker: str, settings: Dict) -> None:
                 with st.spinner("Red-teaming…"):
                     rt = get_red_team(ticker, context)
                 if rt:
-                    st.markdown(f"**Strongest counter-argument:** {rt.strongest_counterargument}")
-                    st.markdown(f"**Most fragile assumption:** {rt.most_fragile_assumption}")
-                    st.markdown(f"**What bulls are ignoring:** {rt.what_bulls_are_ignoring}")
-                    st.markdown(f"**What bears are ignoring:** {rt.what_bears_are_ignoring}")
-                    st.error(f"**Fastest falsifier:** {rt.fastest_falsifier}")
+                    st.session_state[rt_key] = rt
             except Exception as exc:
                 error_card("Red team error", str(exc))
+
+        rt = st.session_state.get(rt_key)
+        if rt:
+            st.markdown(f"**Strongest counter-argument:** {rt.strongest_counterargument}")
+            st.markdown(f"**Most fragile assumption:** {rt.most_fragile_assumption}")
+            st.markdown(f"**What bulls are ignoring:** {rt.what_bulls_are_ignoring}")
+            st.markdown(f"**What bears are ignoring:** {rt.what_bears_are_ignoring}")
+            st.error(f"**Fastest falsifier:** {rt.fastest_falsifier}")
 
     # ── Memo ─────────────────────────────────────────────────────────────────
     with memo_tab:
@@ -877,7 +892,7 @@ def tab_peer_comps(ticker: str, settings: Dict) -> None:
     from ui.components import error_card
     import pandas as pd
 
-    st.caption("Compare key ratios against sector peers. Edit the peer list then click Load.")
+    st.caption("Compare key ratios against sector peers. Edit the peer list and click Refresh to update.")
 
     default_peers = _DEFAULT_PEERS.get(ticker.upper(), [])
     peer_input = st.text_input(
@@ -887,7 +902,7 @@ def tab_peer_comps(ticker: str, settings: Dict) -> None:
         placeholder="e.g. AMD, INTC, QCOM",
     )
 
-    if st.button("Load Peer Comps", type="primary", key=f"peers_load_{ticker}"):
+    if st.button("Refresh Peer Comps", key=f"peers_load_{ticker}"):
         parsed = [t.strip().upper() for t in peer_input.split(",") if t.strip()]
         with st.spinner(f"Fetching fundamentals for {ticker} + {len(parsed)} peers…"):
             try:
@@ -899,8 +914,19 @@ def tab_peer_comps(ticker: str, settings: Dict) -> None:
 
     comps = st.session_state.get(f"peer_comps_{ticker}")
     if not comps:
-        st.info("Enter peer tickers above and click Load Peer Comps.")
-        return
+        # Auto-load with defaults on first visit
+        parsed = [t.strip().upper() for t in peer_input.split(",") if t.strip()]
+        if parsed:
+            with st.spinner(f"Fetching peer comps for {ticker}…"):
+                try:
+                    comps = get_peer_comps(ticker, parsed)
+                    st.session_state[f"peer_comps_{ticker}"] = comps
+                except Exception as exc:
+                    error_card("Peer comps error", str(exc))
+                    return
+        else:
+            st.info("Add peer tickers above and click Refresh.")
+            return
 
     if comps.synthesis:
         st.info(comps.synthesis)
@@ -976,20 +1002,6 @@ def tab_peer_comps(ticker: str, settings: Dict) -> None:
             st.plotly_chart(fig, use_container_width=True, key=f"peer_bar_{ticker}_{field}")
 
 
-def _tab_gate(key: str, label: str, fn, *args, **kwargs) -> None:
-    """Lazy tab: show a Load button on first visit, then render the full tab content."""
-    loaded_key = f"_gate_{key}"
-    if loaded_key not in st.session_state:
-        st.write("")
-        st.caption(f"**{label}** loads on demand to keep the initial page fast.")
-        if st.button(f"Load {label} →", key=f"_gate_btn_{key}", type="primary"):
-            st.session_state[loaded_key] = True
-            st.rerun()
-    else:
-        t0 = time.perf_counter()
-        fn(*args, **kwargs)
-        _record_timing(key, time.perf_counter() - t0)
-
 
 def run_ticker_mode(ticker: str, settings: Dict) -> None:
     from ui.stcache import cached_fundamentals
@@ -1018,17 +1030,25 @@ def run_ticker_mode(ticker: str, settings: Dict) -> None:
     with tabs[0]:
         tab_overview(ticker, settings)
     with tabs[1]:
-        _tab_gate(f"financials_{ticker}", "Financials", tab_financials, ticker, settings)
+        tab_financials(ticker, settings)
     with tabs[2]:
-        _tab_gate(f"calls_{ticker}", "Earnings Calls", tab_earnings_calls, ticker, settings)
+        tab_earnings_calls(ticker, settings)
     with tabs[3]:
-        _tab_gate(f"news_{ticker}", "News", tab_news, ticker, settings)
+        tab_news(ticker, settings)
     with tabs[4]:
-        _tab_gate(f"analyst_{ticker}", "Analyst Mode", tab_analyst_mode, ticker, settings)
+        tab_analyst_mode(ticker, settings)
     with tabs[5]:
         tab_peer_comps(ticker, settings)
     with tabs[6]:
-        tab_thesis_memo(ticker, settings)
+        _thesis_loaded_key = f"_thesis_loaded_{ticker}"
+        if _thesis_loaded_key not in st.session_state:
+            st.write("")
+            st.caption("Thesis & Memo assembles inputs from all other tabs and runs Sonnet. Load when ready.")
+            if st.button("Load Thesis & Memo →", type="primary", key=f"_thesis_btn_{ticker}"):
+                st.session_state[_thesis_loaded_key] = True
+                st.rerun()
+        else:
+            tab_thesis_memo(ticker, settings)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1102,28 +1122,32 @@ def tab_competitors(url: str, domain: str) -> None:
 
     st.caption("Auto-discovers 3-5 competitors then crawls each for a side-by-side feature comparison.")
 
-    # We need a summary of the target product to find competitors
-    results_key = f"company_intel__{url}"
-    ci = st.session_state.get(results_key)
-    company_summary = (ci or {}).get("synthesis_text", "") or domain
-
-    if st.button("Discover & Compare Competitors", type="primary", key=f"comp_discover_{domain}"):
-        comp_key = f"competitors__{domain}"
-        with st.spinner("Identifying competitors (Sonnet)…"):
-            competitors = discover_competitors(domain, company_summary)
-        if not competitors:
-            st.warning("Could not identify competitors automatically. Try running Company Intel first.")
-            return
-        st.caption(f"Identified: {', '.join(c.get('name', c['domain']) for c in competitors)}")
-        with st.spinner(f"Crawling {len(competitors)} competitor sites…"):
-            comparison = build_competitive_comparison(domain, company_summary, competitors)
-        st.session_state[comp_key] = {"competitors": competitors, "comparison": comparison}
-
     comp_key = f"competitors__{domain}"
     comp_data = st.session_state.get(comp_key)
+
     if not comp_data:
-        st.info("Click the button above to start competitor discovery.")
-        return
+        # Use company intel summary if already fetched, otherwise web search covers the gap
+        results_key = f"company_intel__{url}"
+        ci = st.session_state.get(results_key)
+        company_summary = (ci or {}).get("synthesis_text", "")
+
+        with st.spinner("Searching for competitors (web search + Sonnet)…"):
+            competitors, discover_diag = discover_competitors(domain, company_summary)
+        if not competitors:
+            st.warning("Could not identify competitors automatically.")
+            with st.expander("Discovery diagnostic"):
+                st.json(discover_diag)
+            return
+        st.caption(f"Identified: {', '.join(c.get('name', c['domain']) for c in competitors)}")
+        with st.spinner(f"Gathering data on {len(competitors)} competitors…"):
+            comparison, crawl_diags = build_competitive_comparison(domain, company_summary, competitors)
+        st.session_state[comp_key] = {
+            "competitors": competitors,
+            "comparison": comparison,
+            "discover_diag": discover_diag,
+            "crawl_diags": crawl_diags,
+        }
+        comp_data = st.session_state[comp_key]
 
     competitors = comp_data.get("competitors", [])
     comparison = comp_data.get("comparison", "")
@@ -1137,61 +1161,80 @@ def tab_competitors(url: str, domain: str) -> None:
         st.divider()
         st.markdown(comparison)
 
+    with st.expander("Diagnostic log"):
+        st.json({
+            "discover": comp_data.get("discover_diag"),
+            "crawls": comp_data.get("crawl_diags"),
+        })
+
 
 def tab_reviews(url: str, domain: str) -> None:
     from analysis.review_sentiment import fetch_review_sentiment
     from ui.components import error_card
 
-    st.caption("Searches G2, Capterra, and Product Hunt for customer reviews.")
+    st.caption("Searches G2, Product Hunt, Trustpilot, and Capterra for customer reviews.")
 
-    reviews_key = f"reviews__{domain}"
+    reviews_key = f"reviews_v3__{domain}"
     if reviews_key not in st.session_state:
-        if st.button("Fetch Customer Reviews", type="primary", key=f"reviews_btn_{domain}"):
-            with st.spinner("Checking G2, Capterra, and Product Hunt…"):
-                reviews = fetch_review_sentiment(domain)
-            st.session_state[reviews_key] = reviews
-    else:
-        reviews = st.session_state[reviews_key]
-        if not reviews:
-            st.info("No review data found on G2, Capterra, or Product Hunt for this domain.")
-            return
+        with st.spinner("Checking G2, Product Hunt, Trustpilot, Capterra…"):
+            reviews = fetch_review_sentiment(domain)
+        st.session_state[reviews_key] = reviews
 
-        for r in reviews:
-            platform = r.get("platform", "Unknown")
-            stars = r.get("star_rating")
-            count = r.get("review_count")
-            with st.expander(
-                f"**{platform}** — {'★' * int(stars or 0)}{f' {stars:.1f}/5' if stars else ''}"
-                f"{f' · {count:,} reviews' if count else ''}",
-                expanded=True,
-            ):
-                summary = r.get("sentiment_summary")
-                if summary:
-                    st.info(summary)
+    reviews = st.session_state[reviews_key]
 
-                col1, col2 = st.columns(2)
-                pros = r.get("top_pros") or []
-                cons = r.get("top_cons") or []
-                with col1:
-                    if pros:
-                        st.markdown("**Top pros**")
-                        for p in pros:
-                            st.markdown(f"+ {p}")
-                with col2:
-                    if cons:
-                        st.markdown("**Top cons**")
-                        for c in cons:
-                            st.markdown(f"- {c}")
+    # Diagnostic-only sentinel
+    if len(reviews) == 1 and reviews[0].get("_diagnostic_only"):
+        all_diag = reviews[0].get("_diag", [])
+        st.info("No review data found. See diagnostic log below.")
+        with st.expander("Diagnostic log — what was tried"):
+            for d in all_diag:
+                st.json(d)
+        return
 
-                use_cases = r.get("common_use_cases") or []
-                if use_cases:
-                    st.caption("Common use cases: " + " · ".join(use_cases))
+    if not reviews:
+        st.info("No review data found on G2, Product Hunt, Trustpilot, or Capterra.")
+        return
 
-    if reviews_key in st.session_state and not st.session_state.get(reviews_key):
-        if st.button("Fetch Customer Reviews", type="primary", key=f"reviews_btn2_{domain}"):
-            with st.spinner("Checking G2, Capterra, and Product Hunt…"):
-                st.session_state[reviews_key] = fetch_review_sentiment(domain)
-            st.rerun()
+    # Show all_diag in expander (first result carries it)
+    all_diag = reviews[0].pop("_all_diag", None)
+
+    for r in reviews:
+        if r.get("_diagnostic_only"):
+            continue
+        platform = r.get("platform", "Unknown")
+        stars = r.get("star_rating")
+        count = r.get("review_count")
+        with st.expander(
+            f"**{platform}** — {'★' * int(stars or 0)}{f' {stars:.1f}/5' if stars else ''}"
+            f"{f' · {count:,} reviews' if count else ''}",
+            expanded=True,
+        ):
+            summary = r.get("sentiment_summary")
+            if summary:
+                st.info(summary)
+
+            col1, col2 = st.columns(2)
+            pros = r.get("top_pros") or []
+            cons = r.get("top_cons") or []
+            with col1:
+                if pros:
+                    st.markdown("**Top pros**")
+                    for p in pros:
+                        st.markdown(f"+ {p}")
+            with col2:
+                if cons:
+                    st.markdown("**Top cons**")
+                    for c in cons:
+                        st.markdown(f"- {c}")
+
+            use_cases = r.get("common_use_cases") or []
+            if use_cases:
+                st.caption("Common use cases: " + " · ".join(use_cases))
+
+    if all_diag:
+        with st.expander("Diagnostic log — sources tried"):
+            for d in all_diag:
+                st.json(d)
 
 
 def run_url_mode(url: str, settings: Dict) -> None:

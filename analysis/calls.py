@@ -236,7 +236,7 @@ def stream_call_synthesis(
             ],
         }
     ]
-    return llm.call(SONNET, messages, system=_SYSTEM_SYNTHESIS, mode="stream", max_tokens=3000)
+    return llm.call(SONNET, messages, system=_SYSTEM_SYNTHESIS, mode="stream", max_tokens=5000)
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────

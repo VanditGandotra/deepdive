@@ -55,7 +55,8 @@ def extract_hiring_intel(domain: str, hiring_signals: List[str]) -> Dict:
             HAIKU, messages,
             system=_SYSTEM,
             prompt_version="v1",
-            max_tokens=800,
+            max_tokens=2000,
+            continue_on_truncation=True,
         )
         # Parse JSON from response
         match = re.search(r"\{.*\}", raw, re.DOTALL)

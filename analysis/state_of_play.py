@@ -89,5 +89,5 @@ def stream_state_of_play(
         system=_SYSTEM,
         prompt_version=_PROMPT_VERSION,
         mode="stream",
-        max_tokens=400,
+        max_tokens=1200,
     )
