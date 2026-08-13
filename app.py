@@ -1492,21 +1492,67 @@ def tab_product_deep_dive(url: str, domain: str) -> None:
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _sidebar_nav() -> None:
+    """Sidebar mode switcher. Sets query params and reruns when mode changes."""
+    view = st.query_params.get("view", "")
+    has_tickers = "tickers" in st.query_params
+
+    if view in ("portfolio", "portfolio_analysis"):
+        current_mode = "Portfolio"
+    elif has_tickers or view == "ticker":
+        current_mode = "Batch"
+    else:
+        current_mode = "Single Stock"
+
+    with st.sidebar:
+        st.markdown("### DeepDive")
+        mode = st.radio(
+            "Mode",
+            ["Single Stock", "Batch Analysis", "Portfolio"],
+            index=["Single Stock", "Batch Analysis", "Portfolio"].index(current_mode),
+            label_visibility="collapsed",
+        )
+
+    if mode == current_mode:
+        return
+
+    st.query_params.clear()
+    if mode == "Batch Analysis":
+        st.query_params["tickers"] = ""
+    elif mode == "Portfolio":
+        st.query_params["view"] = "portfolio"
+    st.rerun()
+
+
 def main() -> None:
     from ui.components import inject_design_css
     inject_design_css()
 
-    # NEW: Portfolio mode
-    if "view" in st.query_params and st.query_params["view"] == "portfolio":
+    _sidebar_nav()
+
+    view = st.query_params.get("view", "")
+
+    # Sub-views (no top-level nav entry)
+    if view == "portfolio_analysis":
+        from ui.portfolio_analysis_ui import render_portfolio_analysis_page
+        render_portfolio_analysis_page()
+        return
+
+    if view == "ticker":
+        from ui.ticker_drillthrough_ui import render_ticker_drillthrough_page
+        render_ticker_drillthrough_page()
+        return
+
+    # Top-level modes
+    if view == "portfolio":
         from ui.portfolio_ui import render_portfolio_page
         render_portfolio_page()
         return
 
-    # NEW: Multi-ticker batch mode
     if "tickers" in st.query_params:
         from ui.batch_ui import render_batch_page
         render_batch_page()
-        return  # Don't render the single-ticker page
+        return
 
     settings = {
         "force_refresh": st.session_state.get("force_refresh", False),
