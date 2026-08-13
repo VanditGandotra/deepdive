@@ -53,6 +53,7 @@ PROMPT_VERSIONS: dict[str, str] = {
     "product_explainer":       "v1",
     "screen_explanation":      "v1",
     "delta_narrative":         "v1",
+    "optimizer_summary":       "v1",
 }
 
 # ── Cost per million tokens (approximate 2025 pricing — verify at console) ───

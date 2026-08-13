@@ -67,15 +67,24 @@ class TestOptimizer:
         with pytest.raises(ValueError, match="2 tickers"):
             optimize_portfolio(["AAPL"], [1.0])
 
-    def test_sensitivity_keys_match_tickers(self):
-        from core.optimizer import optimize_portfolio
+    def test_sensitivity_rows_match_tickers(self):
+        from core.optimizer import optimize_portfolio, SensitivityRow
         with _patch_get_prices(TICKERS):
             result = optimize_portfolio(TICKERS, WEIGHTS, method="max_sharpe")
-        assert set(result.sensitivity.keys()) == set(result.tickers)
+        # sensitivity is now a list of SensitivityRow (±shock per ticker)
+        assert isinstance(result.sensitivity, list)
+        row_tickers = {r.ticker for r in result.sensitivity}
+        assert row_tickers == set(result.tickers)
+        # each ticker should have two rows: +delta and -delta
+        from collections import Counter
+        counts = Counter(r.ticker for r in result.sensitivity)
         for t in result.tickers:
-            w_delta, sharpe_delta = result.sensitivity[t]
-            assert isinstance(w_delta, float)
-            assert isinstance(sharpe_delta, float)
+            assert counts[t] == 2, f"Expected 2 rows (±shock) for {t}, got {counts[t]}"
+        for row in result.sensitivity:
+            assert isinstance(row, SensitivityRow)
+            assert isinstance(row.weight_delta, float)
+        # legacy dict still populated for UI compatibility
+        assert set(result.sensitivity_legacy.keys()) == set(result.tickers)
 
 
 class TestMonteCarlo:

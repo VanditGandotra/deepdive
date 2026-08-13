@@ -58,19 +58,58 @@ def _render_optimizer_tab(method: str, tickers: list[str], current_weights: list
         st.metric("Volatility", f"{result.expected_vol * 100:.1f}%")
         st.metric("Sharpe", f"{result.sharpe:.2f}")
 
-    st.subheader("Sensitivity (±2% weight bump)")
+    st.subheader("Sensitivity — how weights move when expected returns are shocked ±2%")
+    st.caption(
+        "At a portfolio optimum, first-order weight sensitivity is ≈ 0 by construction, "
+        "so bumping weights tells you nothing. This table shocks each holding's expected "
+        "return estimate ±2pp and shows how the optimizer re-allocates."
+    )
+    # Use structured sensitivity rows when available (new API), fall back to legacy dict
     sens_rows = []
-    proposed_map = dict(zip(result.tickers, result.proposed_weights))
-    current_map = dict(zip(result.tickers, result.current_weights))
-    for t, (w_delta, sharpe_delta) in result.sensitivity.items():
-        sens_rows.append({
-            "Ticker": t,
-            "Current Weight": f"{current_map.get(t, 0) * 100:.1f}%",
-            "Proposed Weight": f"{proposed_map.get(t, 0) * 100:.1f}%",
-            "Sharpe Impact (+2%)": f"{sharpe_delta:+.3f}",
-        })
+    if result.sensitivity:
+        from core.optimizer import SensitivityRow
+        proposed_map = dict(zip(result.tickers, result.proposed_weights))
+        current_map = dict(zip(result.tickers, result.current_weights))
+        by_ticker: dict[str, dict] = {}
+        for row in result.sensitivity:
+            entry = by_ticker.setdefault(row.ticker, {
+                "Ticker": row.ticker,
+                "Current Weight": f"{current_map.get(row.ticker, 0) * 100:.1f}%",
+                "Proposed Weight": f"{proposed_map.get(row.ticker, 0) * 100:.1f}%",
+            })
+            if row.return_shock > 0:
+                entry["+2pp return shock → weight Δ"] = f"{row.weight_delta * 100:+.1f}pp"
+            else:
+                entry["-2pp return shock → weight Δ"] = f"{row.weight_delta * 100:+.1f}pp"
+        sens_rows = list(by_ticker.values())
+    elif result.sensitivity_legacy:
+        proposed_map = dict(zip(result.tickers, result.proposed_weights))
+        current_map = dict(zip(result.tickers, result.current_weights))
+        for t, (shock, w_delta) in result.sensitivity_legacy.items():
+            sens_rows.append({
+                "Ticker": t,
+                "Current Weight": f"{current_map.get(t, 0) * 100:.1f}%",
+                "Proposed Weight": f"{proposed_map.get(t, 0) * 100:.1f}%",
+                "+2pp return shock → weight Δ": f"{w_delta * 100:+.1f}pp",
+            })
     if sens_rows:
         st.dataframe(pd.DataFrame(sens_rows), hide_index=True, use_container_width=True)
+
+    # Prose summary — collapsible, default open on first render, does not re-run optimizer
+    summary_key = f"_opt_summary_{method}_{'_'.join(result.tickers)}"
+    with st.expander("Written explanation", expanded=(summary_key not in st.session_state)):
+        if summary_key not in st.session_state:
+            from core.optimizer import generate_optimizer_summary
+            from ui.components import streaming_container
+            container = st.empty()
+            with st.spinner("Generating explanation (Sonnet)…"):
+                summary_iter = generate_optimizer_summary(result, method)
+                st.session_state[summary_key] = streaming_container(summary_iter, container)
+        else:
+            st.markdown(st.session_state[summary_key])
+        if st.button("Regenerate explanation", key=f"portfolio_analysis__regen_summary__{method}"):
+            del st.session_state[summary_key]
+            st.rerun()
 
 
 def _render_montecarlo(weights: list[float], tickers: list[str]) -> None:
