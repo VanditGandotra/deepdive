@@ -6,6 +6,12 @@ import pandas as pd
 
 
 @dataclass
+class EnrichmentResult:
+    portfolio: "Portfolio"
+    failed: List[str]   # tickers whose price fetch raised; their market_value stays None
+
+
+@dataclass
 class Holding:
     ticker: str
     shares: float
@@ -64,21 +70,19 @@ class Portfolio:
         return pd.DataFrame(rows)
 
 
-def enrich_with_prices(portfolio: Portfolio) -> Portfolio:
+def enrich_with_prices(portfolio: Portfolio) -> EnrichmentResult:
     """
-    Fill in current_price, market_value, unrealized_pnl, weight, sector
-    using data/market.py get_fundamentals (which is SQLite-cached).
-    Mutates and returns the portfolio.
+    Fill in current_price, market_value, unrealized_pnl, weight, sector.
+    Always returns EnrichmentResult; failed list is empty on full success.
     """
     from data.market import get_fundamentals
 
-    total_value = 0.0
+    failed: List[str] = []
     for h in portfolio.holdings:
         if h.is_cash:
             h.current_price = 1.0
-            h.market_value = h.shares  # shares = cash amount in dollars
+            h.market_value = h.shares  # shares = dollar amount
             h.sector = "Cash"
-            total_value += h.market_value
             continue
         try:
             fund = get_fundamentals(h.ticker)
@@ -89,9 +93,8 @@ def enrich_with_prices(portfolio: Portfolio) -> Portfolio:
                 cost_total = h.cost_basis * h.shares
                 h.unrealized_pnl = h.market_value - cost_total
                 h.unrealized_pnl_pct = h.unrealized_pnl / cost_total if cost_total > 0 else None
-            total_value += h.market_value
         except Exception:
-            pass
+            failed.append(h.ticker)
 
     portfolio.compute_weights()
-    return portfolio
+    return EnrichmentResult(portfolio=portfolio, failed=failed)

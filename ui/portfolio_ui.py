@@ -6,7 +6,7 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-from core.portfolio import Holding, Portfolio, enrich_with_prices
+from core.portfolio import EnrichmentResult, Holding, Portfolio, enrich_with_prices
 from data.portfolio_store import (
     create_portfolio, delete_portfolio, get_holdings,
     get_portfolio_id, get_portfolio_names, save_holdings,
@@ -92,7 +92,10 @@ def _build_portfolio(portfolio_id: int, name: str) -> Portfolio:
         is_cash=bool(h["is_cash"]),
     ) for h in raw]
     pf = Portfolio(name=name, holdings=holdings)
-    return enrich_with_prices(pf)
+    result: EnrichmentResult = enrich_with_prices(pf)
+    if result.failed:
+        st.warning(f"Could not fetch prices for: {', '.join(result.failed)}. Their market values show as $0.")
+    return result.portfolio
 
 
 def _render_portfolio_editor(portfolio_id: int, portfolio_name: str) -> Optional[Portfolio]:

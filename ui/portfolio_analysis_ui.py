@@ -165,18 +165,36 @@ def render_portfolio_analysis_page() -> None:
             is_cash=bool(h["is_cash"]),
         ) for h in raw]
         portfolio = Portfolio(name=portfolio_name, holdings=holdings)
-        portfolio, failed = enrich_with_prices(portfolio)
-        if failed:
-            st.warning(f"Could not fetch prices for: {', '.join(failed)}")
+        from core.portfolio import EnrichmentResult
+        enrichment: EnrichmentResult = enrich_with_prices(portfolio)
+        portfolio = enrichment.portfolio
+        failed = enrichment.failed
 
-    equity_holdings = [h for h in portfolio.holdings if not h.is_cash and h.ticker in tickers]
-    eq_tickers = [h.ticker for h in equity_holdings]
-    tv = portfolio.total_value
-    current_weights = [(h.market_value or 0) / tv if tv > 0 else 1.0 / len(equity_holdings)
-                       for h in equity_holdings]
+    # Surface pricing failures and gate optimization
+    equity_holdings_all = [h for h in portfolio.holdings if not h.is_cash and h.ticker in tickers]
+    failed_eq = [t for t in failed if t in tickers]
+    priced_eq = [h for h in equity_holdings_all if h.ticker not in failed]
+
+    if failed_eq:
+        failed_weight = sum(h.weight or 0 for h in equity_holdings_all if h.ticker in failed_eq)
+        st.error(
+            f"**Price fetch failed for: {', '.join(failed_eq)}** "
+            f"(combined portfolio weight: {failed_weight * 100:.1f}%). "
+            "Optimizer weights from incomplete data would be misleading."
+        )
+        if not st.checkbox(
+            f"Proceed anyway — exclude {', '.join(failed_eq)} and optimize over remaining positions",
+            key="proceed_with_missing",
+        ):
+            st.stop()
+
+    eq_tickers = [h.ticker for h in priced_eq]
+    tv = sum(h.market_value or 0 for h in priced_eq)
+    current_weights = [(h.market_value or 0) / tv if tv > 0 else 1.0 / len(priced_eq)
+                       for h in priced_eq]
 
     if len(eq_tickers) < 2:
-        st.warning("Need at least 2 equity positions to run optimizer.")
+        st.warning("Need at least 2 priced equity positions to run optimizer.")
         return
 
     st.subheader("Optimizer")

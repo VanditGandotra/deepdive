@@ -174,7 +174,7 @@ class TestPortfolioCRUD:
 
 # ── Tests: Portfolio model ─────────────────────────────────────────────────────
 
-from core.portfolio import Holding, Portfolio
+from core.portfolio import EnrichmentResult, Holding, Portfolio, enrich_with_prices
 
 
 class TestPortfolioModel:
@@ -300,3 +300,53 @@ class TestCsvParser:
         df = _parse_csv(_FakeUpload(csv))
         assert df is not None
         assert df.iloc[0]["Ticker"] == "AAPL"
+
+
+# ── Tests: EnrichmentResult contract ─────────────────────────────────────────
+
+class TestEnrichmentResult:
+
+    def test_enrich_always_returns_enrichment_result(self) -> None:
+        """enrich_with_prices must return EnrichmentResult on every path."""
+        from unittest.mock import patch, MagicMock
+        fund = MagicMock()
+        fund.current_price = 150.0
+        fund.sector = "Technology"
+        pf = Portfolio(name="T", holdings=[Holding(ticker="AAPL", shares=10)])
+        with patch("data.market.get_fundamentals", return_value=fund):
+            result = enrich_with_prices(pf)
+        assert isinstance(result, EnrichmentResult)
+        assert result.failed == []
+        assert result.portfolio.holdings[0].market_value == pytest.approx(1500.0)
+
+    def test_enrich_collects_failed_tickers(self) -> None:
+        """Tickers whose fetch raises must appear in result.failed, not crash."""
+        from unittest.mock import patch
+        pf = Portfolio(name="T", holdings=[
+            Holding(ticker="GOOD", shares=5),
+            Holding(ticker="BAD", shares=3),
+        ])
+        def fake_get(ticker, **_):
+            if ticker == "BAD":
+                raise RuntimeError("network error")
+            m = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+            m.current_price = 100.0
+            m.sector = "X"
+            return m
+        with patch("data.market.get_fundamentals", side_effect=fake_get):
+            result = enrich_with_prices(pf)
+        assert isinstance(result, EnrichmentResult)
+        assert "BAD" in result.failed
+        assert "GOOD" not in result.failed
+
+    def test_enrich_empty_portfolio(self) -> None:
+        pf = Portfolio(name="Empty", holdings=[])
+        result = enrich_with_prices(pf)
+        assert isinstance(result, EnrichmentResult)
+        assert result.failed == []
+
+    def test_enrich_cash_row_never_fails(self) -> None:
+        pf = Portfolio(name="T", holdings=[Holding(ticker="CASH", shares=5000, is_cash=True)])
+        result = enrich_with_prices(pf)
+        assert result.failed == []
+        assert result.portfolio.holdings[0].market_value == pytest.approx(5000.0)
