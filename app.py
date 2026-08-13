@@ -1493,33 +1493,30 @@ def tab_product_deep_dive(url: str, domain: str) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _sidebar_nav() -> None:
-    """Sidebar mode switcher. Sets query params and reruns when mode changes."""
+    """Sidebar mode switcher. Defensive — a bad query param never crashes the nav."""
+    from ui.modes import Mode, detect, display_labels, from_label, label_index, LABELS
+
     view = st.query_params.get("view", "")
     has_tickers = "tickers" in st.query_params
-
-    if view in ("portfolio", "portfolio_analysis"):
-        current_mode = "Portfolio"
-    elif has_tickers or view == "ticker":
-        current_mode = "Batch"
-    else:
-        current_mode = "Single Stock"
+    current = detect(view, has_tickers)
 
     with st.sidebar:
         st.markdown("### DeepDive")
-        mode = st.radio(
+        chosen_label = st.radio(
             "Mode",
-            ["Single Stock", "Batch Analysis", "Portfolio"],
-            index=["Single Stock", "Batch Analysis", "Portfolio"].index(current_mode),
+            display_labels(),
+            index=label_index(current),
             label_visibility="collapsed",
         )
 
-    if mode == current_mode:
+    chosen = from_label(chosen_label)
+    if chosen == current:
         return
 
     st.query_params.clear()
-    if mode == "Batch Analysis":
+    if chosen == Mode.BATCH:
         st.query_params["tickers"] = ""
-    elif mode == "Portfolio":
+    elif chosen == Mode.PORTFOLIO:
         st.query_params["view"] = "portfolio"
     st.rerun()
 
