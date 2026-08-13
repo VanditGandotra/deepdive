@@ -1,11 +1,14 @@
 """DeepDive — Streamlit entry point. Auto-detects ticker vs URL mode."""
 from __future__ import annotations
 
+import logging
 import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterator, List, Optional
+
+logger = logging.getLogger(__name__)
 
 import streamlit as st
 
@@ -418,12 +421,23 @@ _SIGNAL_CONF_COLOR = {"high": "#2ecc71", "medium": "#f39c12", "low": "#95a5a6"}
 
 
 def _render_signal_scorecard(summary) -> None:
-    """Render EarningsSignal list as an accessibility-safe scorecard (dot + label)."""
-    if not summary.signals:
+    """Render EarningsSignal list as an accessibility-safe scorecard (dot + label).
+
+    Uses getattr so stale pickled CallSummary objects (from before the signals
+    field existed) degrade gracefully instead of raising AttributeError.
+    """
+    signals = getattr(summary, "signals", None)
+    if not signals:
+        # Distinguish genuinely missing (stale cache) from a live neutral reading.
+        st.caption(
+            "📋 Signal data not available for this cached analysis — "
+            "clear the in-memory cache and re-run to generate signals."
+        )
         return
-    overall_dot, overall_label = _SIGNAL_DOT.get(summary.signal_overall, ("⚪", "Neutral"))
+    overall = getattr(summary, "signal_overall", "neutral")
+    overall_dot, overall_label = _SIGNAL_DOT.get(overall, ("⚪", "Neutral"))
     st.markdown(f"**Signal Scorecard** — overall: {overall_dot} {overall_label}")
-    for sig in summary.signals:
+    for sig in signals:
         dot, label = _SIGNAL_DOT.get(sig.signal, ("⚪", "Neutral"))
         conf_color = _SIGNAL_CONF_COLOR.get(sig.confidence, "#95a5a6")
         with st.container():
@@ -493,7 +507,11 @@ def tab_earnings_calls(ticker: str, settings: Dict) -> None:
     for i, (col, summary, sentiment) in enumerate(zip(col_tabs, summaries, sentiments)):
         with col:
             if summary:
-                _render_signal_scorecard(summary)
+                try:
+                    _render_signal_scorecard(summary)
+                except Exception as _scorecard_err:
+                    logger.exception("Signal scorecard failed for %s", ticker)
+                    st.caption(f"⚠ Signal scorecard unavailable: {_scorecard_err}")
                 st.markdown("**Key Themes**")
                 for theme in summary.key_themes:
                     st.markdown(f"- {theme}")
@@ -1060,18 +1078,29 @@ def run_ticker_mode(ticker: str, settings: Dict) -> None:
         "Thesis & Memo",
     ])
 
+    _TAB_NAMES = ["Overview", "Financials", "Earnings Calls", "News",
+                  "Analyst Mode", "Peer Comps", "Thesis & Memo"]
+
+    def _guarded(name: str, fn, *args):
+        try:
+            fn(*args)
+        except Exception as _e:
+            logger.exception("%s tab failed for %s", name, ticker)
+            from ui.components import error_card
+            error_card(f"{name} section failed", str(_e))
+
     with tabs[0]:
-        tab_overview(ticker, settings)
+        _guarded("Overview", tab_overview, ticker, settings)
     with tabs[1]:
-        tab_financials(ticker, settings)
+        _guarded("Financials", tab_financials, ticker, settings)
     with tabs[2]:
-        tab_earnings_calls(ticker, settings)
+        _guarded("Earnings Calls", tab_earnings_calls, ticker, settings)
     with tabs[3]:
-        tab_news(ticker, settings)
+        _guarded("News", tab_news, ticker, settings)
     with tabs[4]:
-        tab_analyst_mode(ticker, settings)
+        _guarded("Analyst Mode", tab_analyst_mode, ticker, settings)
     with tabs[5]:
-        tab_peer_comps(ticker, settings)
+        _guarded("Peer Comps", tab_peer_comps, ticker, settings)
     with tabs[6]:
         _thesis_loaded_key = f"_thesis_loaded_{ticker}"
         if _thesis_loaded_key not in st.session_state:

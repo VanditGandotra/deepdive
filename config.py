@@ -38,7 +38,7 @@ TTL_LLM          = 2_592_000   # 30d (content-hash cache)
 # ── Prompt versions — bump to invalidate LLM content-hash cache ──────────────
 PROMPT_VERSIONS: dict[str, str] = {
     "business_explainer":      "v1",
-    "call_extraction_a":       "v1",
+    "call_extraction_a":       "v2",  # bumped: signals field added to CallSummary
     "call_sentiment_b":        "v1",
     "call_synthesis_c":        "v1",
     "headline_classification": "v2",

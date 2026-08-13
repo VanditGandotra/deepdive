@@ -1,0 +1,8 @@
+{
+  "include": ["core", "data", "ui", "analysis"],
+  "exclude": ["**/__pycache__", ".worktrees"],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": true,
+  "reportMissingModuleSource": false
+}

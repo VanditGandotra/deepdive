@@ -8,8 +8,8 @@ import plotly.graph_objects as go
 from core.schemas import Scenario
 
 
-def _back_button() -> None:
-    if st.button("<- Back to portfolio"):
+def _back_button(key: str = "portfolio_analysis__back") -> None:
+    if st.button("<- Back to portfolio", key=key):
         for k in ["view", "portfolio", "tickers"]:
             st.query_params.pop(k, None)
         st.rerun()
@@ -139,7 +139,7 @@ def render_portfolio_analysis_page() -> None:
     from data.portfolio_store import get_holdings, get_portfolio_id
 
     st.title("Portfolio Optimizer & Monte Carlo")
-    _back_button()
+    _back_button(key="portfolio_analysis__back_top")
 
     portfolio_name = st.query_params.get("portfolio", "")
     tickers_param = st.query_params.get("tickers", "")
@@ -184,7 +184,7 @@ def render_portfolio_analysis_page() -> None:
         )
         if not st.checkbox(
             f"Proceed anyway — exclude {', '.join(failed_eq)} and optimize over remaining positions",
-            key="proceed_with_missing",
+            key="portfolio_analysis__proceed_with_missing",
         ):
             st.stop()
 
@@ -219,7 +219,7 @@ def render_portfolio_analysis_page() -> None:
     _render_scenario_cards_section(eq_tickers)
 
     st.divider()
-    _back_button()
+    _back_button(key="portfolio_analysis__back_bottom")
     st.caption("Research tooling only — not investment advice.")
 
 
@@ -252,7 +252,7 @@ def _render_scenario_cards_section(tickers: list[str]) -> None:
         with st.expander(f"{ticker} — click to expand scenarios"):
             cache_key = f"_scenario_{ticker}"
             if cache_key not in st.session_state:
-                if st.button(f"Load scenarios for {ticker}", key=f"_scenario_load_{ticker}"):
+                if st.button(f"Load scenarios for {ticker}", key=f"portfolio_analysis__scenario_load__{ticker}"):
                     with st.spinner(f"Analyzing {ticker}…"):
                         try:
                             st.session_state[cache_key] = analyze_ticker(ticker)
@@ -263,7 +263,7 @@ def _render_scenario_cards_section(tickers: list[str]) -> None:
                 result = st.session_state[cache_key]
                 if isinstance(result, Exception):
                     st.error(f"Analysis failed: {result}")
-                    if st.button(f"Retry {ticker}", key=f"_scenario_retry_{ticker}"):
+                    if st.button(f"Retry {ticker}", key=f"portfolio_analysis__scenario_retry__{ticker}"):
                         del st.session_state[cache_key]
                         st.rerun()
                 else:
@@ -287,7 +287,7 @@ def _render_scenario_cards_section(tickers: list[str]) -> None:
 
                     if st.button(
                         f"Drill into {ticker} →",
-                        key=f"_scenario_drill_{ticker}",
+                        key=f"portfolio_analysis__drill__{ticker}",
                     ):
                         st.query_params["view"] = "ticker"
                         st.query_params["symbol"] = ticker
