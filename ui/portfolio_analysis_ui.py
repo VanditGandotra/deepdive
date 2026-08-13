@@ -136,7 +136,7 @@ def _render_montecarlo(weights: list[float], tickers: list[str]) -> None:
 
 def render_portfolio_analysis_page() -> None:
     from core.portfolio import enrich_with_prices, Portfolio, Holding
-    from data.cache import get_holdings, get_portfolio_id
+    from data.portfolio_store import get_holdings, get_portfolio_id
 
     st.title("Portfolio Optimizer & Monte Carlo")
     _back_button()
