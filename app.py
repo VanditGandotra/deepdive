@@ -1230,11 +1230,11 @@ def run_ticker_mode(ticker: str, settings: Dict) -> None:
         _CB_ICONS = {"closed": "🟢", "half-open": "🟡", "open": "🔴"}
         _fmp_key_set = bool(_diag_cfg.FMP_API_KEY)
         _chain_rows = [
-            # (display_name, key_type, cb_obj)
-            # key_type: "keyless" | "present" | "missing"
-            ("yfinance", "keyless", _mkt_mod._CB_YFINANCE),
-            ("fmp",      "present" if _fmp_key_set else "missing", _mkt_mod._CB_FMP),
-            ("stooq",    "keyless", _mkt_mod._CB_STOOQ),
+            # (display_name, key_type, cb_obj) — listed in priority order
+            ("edgar",    "keyless",                                   _mkt_mod._CB_EDGAR),
+            ("fmp",      "present" if _fmp_key_set else "missing",    _mkt_mod._CB_FMP),
+            ("yfinance", "keyless",                                   _mkt_mod._CB_YFINANCE),
+            ("stooq",    "keyless",                                   _mkt_mod._CB_STOOQ),
         ]
         _KEY_LABELS = {
             "keyless": "🔓 no key required",
