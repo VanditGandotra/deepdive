@@ -407,24 +407,12 @@ class TestPartialDataFixes:
 
         mock_set.assert_not_called()
 
-    def test_yfinance_session_injects_timeout(self) -> None:
-        """_yf_session must wrap every send with timeout=20 when caller omits it."""
-        from data.market import _yf_session
-        from requests.adapters import HTTPAdapter
-        import requests
-
-        captured: dict = {}
-
-        def fake_adapter_send(self_, request, **kwargs):
-            captured.update(kwargs)
-            raise ConnectionError("test stop")
-
-        with patch.object(HTTPAdapter, "send", fake_adapter_send):
-            session = _yf_session()
-            prep = requests.Request("GET", "http://example.invalid/").prepare()
-            try:
-                session.send(prep)
-            except Exception:
-                pass
-
-        assert captured.get("timeout") == 20
+    def test_yfinance_no_session_override(self) -> None:
+        """yf.Ticker must be called without a session= kwarg so yfinance can
+        use its own curl_cffi session internally (required since yfinance 0.2.50+)."""
+        import inspect
+        import data.market as mkt
+        src = inspect.getsource(mkt)
+        # Confirm _yf_session is gone and no session= is passed to Ticker
+        assert "_yf_session" not in src, "_yf_session must be removed from data.market"
+        assert "session=_yf_session" not in src, "session=_yf_session() must not appear in data.market"

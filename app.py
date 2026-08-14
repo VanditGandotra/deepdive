@@ -528,35 +528,51 @@ def tab_earnings_calls(ticker: str, settings: Dict) -> None:
         had_not_found = any(o.get("status") == "not_found" for o in outcomes)
         had_ok_provider = any(o.get("status") == "ok" for o in outcomes)
         had_error = any(o.get("status") in ("error", "unavailable") for o in outcomes)
-        keyed_providers = [o for o in outcomes if o.get("status") != "no_key"]
-        all_no_key = outcomes and not keyed_providers
+        # Providers that actually attempted a search (not skipped for missing key)
+        searched = [o for o in outcomes if o.get("status") not in ("no_key",)]
+        no_key_names = [o["provider"] for o in outcomes if o.get("status") == "no_key"]
+        searched_names = [o["provider"] for o in searched]
+        all_no_key = outcomes and not searched
 
-        if all_no_key or not outcomes:
+        if not outcomes or all_no_key:
+            # Every provider was skipped — no keys at all, DefeatBeta/MotleyFool
+            # should always run so this state means the chain itself didn't execute
             st.warning(
-                f"No transcript providers are configured. "
-                "**Next step:** add `FMP_API_KEY` to **Streamlit Cloud → App settings → Secrets** "
-                "— it's free at financialmodelingprep.com (250 req/day, covers most US tickers)."
+                "No transcript providers are configured. "
+                "**DefeatBeta** and **MotleyFool** run without keys but may not cover all tickers. "
+                "For broader coverage, add `FMP_API_KEY` to **Streamlit Cloud → App settings → Secrets** "
+                "— free at financialmodelingprep.com (250 req/day)."
             )
         elif had_not_found and not had_ok_provider and not had_error:
-            # At least one keyed provider searched and found nothing
-            st.info(
-                f"No {ticker} transcripts found in the last 8 quarters — "
-                "keyed providers searched and returned zero results. "
-                "This means transcripts may not be available for this ticker through these providers, "
-                "or the ticker is non-US and not covered."
+            # Providers searched and genuinely found nothing for this ticker
+            searched_str = ", ".join(f"**{p}**" for p in searched_names) if searched_names else "all providers"
+            no_key_str = (
+                f" ({', '.join(no_key_names)} skipped — keys not configured)"
+                if no_key_names else ""
             )
+            st.info(
+                f"No **{ticker}** transcripts found in the last 8 quarters. "
+                f"{searched_str} searched and returned nothing{no_key_str}. "
+                "This is a coverage gap, not a fetch failure — the ticker may not be covered "
+                "by these providers, or no recent calls have been transcribed."
+            )
+            if no_key_names:
+                st.caption(
+                    f"Tip: add `FMP_API_KEY` (free, 250 req/day) or `ROIC_API_KEY` to unlock "
+                    "broader transcript coverage in Streamlit Cloud secrets."
+                )
         elif had_error and not had_ok_provider:
             # Providers were configured but all failed (403, timeout, scrape blocked)
             st.warning(
-                f"Transcript fetch failed for **{ticker}** — configured providers returned transport "
-                "errors or were blocked (HTTP 403/429 is common from shared cloud IPs). "
-                "This is a **fetch failure**, not evidence that transcripts don't exist. "
-                "Retry, or add a keyed provider such as FMP_API_KEY."
+                f"Transcript fetch failed for **{ticker}** — configured providers returned errors "
+                "(HTTP 403/429 is common from shared cloud IPs). "
+                "This is a **fetch failure**, not a missing-transcript signal. "
+                "Retry, or add `FMP_API_KEY` for a keyed fallback."
             )
         else:
             st.warning(
                 f"Transcript fetch incomplete for **{ticker}** — some providers searched, some errored. "
-                "See details below."
+                "See provider details below."
             )
 
         _STATUS_ICON = {

@@ -7,6 +7,7 @@ python-dotenv>=1.0.0
 
 # Finance data
 yfinance>=0.2.40
+curl_cffi>=0.5.0
 edgartools>=2.25.0
 pandas>=2.2.0
 numpy>=1.26.0

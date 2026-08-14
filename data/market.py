@@ -8,8 +8,6 @@ from typing import Any, Dict, List, Optional
 
 import yfinance as yf
 import pandas as pd
-import requests
-from requests.adapters import HTTPAdapter
 
 import config as _cfg
 from config import TTL_FUNDAMENTALS, TTL_NEWS, TTL_PRICES
@@ -31,23 +29,6 @@ _CB_FMP      = CircuitBreaker("fmp",      failure_threshold=5, cooldown_secs=300
 _CB_YFINANCE = CircuitBreaker("yfinance", failure_threshold=3, cooldown_secs=300.0)
 _CB_STOOQ    = CircuitBreaker("stooq",    failure_threshold=5, cooldown_secs=120.0)
 
-
-def _yf_session() -> "requests.Session":
-    """requests.Session with desktop User-Agent and 20s read timeout for every call."""
-    session = requests.Session()
-    session.headers["User-Agent"] = (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-    )
-    adapter = HTTPAdapter()
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    _orig_send = session.send
-    def _send_with_timeout(*args, **kwargs):
-        kwargs.setdefault("timeout", 20)
-        return _orig_send(*args, **kwargs)
-    session.send = _send_with_timeout  # type: ignore[method-assign]
-    return session
 
 
 def _check_info(info: Dict[str, Any], ticker: str) -> None:
@@ -92,7 +73,7 @@ def _safe_int(val: Any) -> Optional[int]:
 
 
 def _fetch_prices_yfinance(ticker: str, period: str = "5y") -> PriceData:
-    yf_ticker = yf.Ticker(ticker, session=_yf_session())
+    yf_ticker = yf.Ticker(ticker)
     hist = yf_ticker.history(period=period, auto_adjust=True)
     if hist.empty:
         raise ValueError(f"No price data returned for {ticker}")
@@ -140,7 +121,7 @@ def _fetch_fundamentals_from_stooq(ticker: str) -> Fundamentals:
 
 
 def _fetch_fundamentals_yfinance(ticker: str) -> Fundamentals:
-    yf_ticker = yf.Ticker(ticker, session=_yf_session())
+    yf_ticker = yf.Ticker(ticker)
     info: Dict[str, Any] = yf_ticker.info or {}
     _check_info(info, ticker)
 
@@ -478,7 +459,7 @@ def get_estimates(ticker: str) -> Dict[str, Any]:
     if cached:
         return cached
 
-    yf_ticker = yf.Ticker(ticker, session=_yf_session())
+    yf_ticker = yf.Ticker(ticker)
     result: Dict[str, Any] = {}
 
     # EPS trend
@@ -543,7 +524,7 @@ def get_beat_miss_history(ticker: str) -> List[Dict[str, Any]]:
     if cached:
         return cached
 
-    yf_ticker = yf.Ticker(ticker, session=_yf_session())
+    yf_ticker = yf.Ticker(ticker)
     records: List[Dict[str, Any]] = []
 
     try:
@@ -576,7 +557,7 @@ def get_insiders(ticker: str) -> List[InsiderTransaction]:
     if cached:
         return [InsiderTransaction.model_validate(r) for r in cached]
 
-    yf_ticker = yf.Ticker(ticker, session=_yf_session())
+    yf_ticker = yf.Ticker(ticker)
     transactions: List[InsiderTransaction] = []
     try:
         df = yf_ticker.insider_transactions
@@ -615,7 +596,7 @@ def get_holders(ticker: str) -> List[InstitutionalHolder]:
     if cached:
         return [InstitutionalHolder.model_validate(r) for r in cached]
 
-    yf_ticker = yf.Ticker(ticker, session=_yf_session())
+    yf_ticker = yf.Ticker(ticker)
     holders: List[InstitutionalHolder] = []
     try:
         df = yf_ticker.institutional_holders
@@ -644,7 +625,7 @@ def get_short_interest(ticker: str) -> ShortInterest:
     if cached:
         return ShortInterest.model_validate(cached)
 
-    yf_ticker = yf.Ticker(ticker, session=_yf_session())
+    yf_ticker = yf.Ticker(ticker)
     info = yf_ticker.info or {}
     result = ShortInterest(
         date=None,
@@ -664,7 +645,7 @@ def get_news(ticker: str, days: int = 30) -> List[NewsItem]:
     if cached:
         return [NewsItem.model_validate(r) for r in cached]
 
-    yf_ticker = yf.Ticker(ticker, session=_yf_session())
+    yf_ticker = yf.Ticker(ticker)
     items: List[NewsItem] = []
     cutoff = datetime.utcnow() - timedelta(days=days)
 
