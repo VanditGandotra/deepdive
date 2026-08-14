@@ -14,9 +14,16 @@ from core.schemas import Scenario
 _VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
 
 
-def _holdings_hash(tickers: list[str], weights: list[float]) -> str:
-    """Stable hash of (ticker, weight) pairs — used to key session-state cache."""
+def _holdings_hash(
+    tickers: list[str],
+    weights: list[float],
+    max_pos: float = 0.40,
+    max_sec: float = 0.60,
+    turnover: float = 0.0,
+) -> str:
+    """Stable hash of holdings + constraint params — changing any param busts the cache."""
     content = "|".join(f"{t}:{w:.6f}" for t, w in sorted(zip(tickers, weights)))
+    content += f"|p{max_pos:.3f}|s{max_sec:.3f}|t{turnover:.3f}"
     return hashlib.sha256(content.encode()).hexdigest()[:12]
 
 
@@ -32,6 +39,10 @@ def _render_optimizer_tab(
     tickers: list[str],
     current_weights: list[float],
     holdings_hash: str = "",
+    sector_map: dict[str, str] | None = None,
+    max_pos: float = 0.40,
+    max_sec: float = 0.60,
+    turnover: float = 0.0,
 ) -> None:
     from core.optimizer import optimize_portfolio
 
@@ -42,6 +53,10 @@ def _render_optimizer_tab(
                 tickers=tickers,
                 current_weights=current_weights,
                 method=method,
+                max_position_weight=max_pos,
+                max_sector_weight=max_sec,
+                turnover_penalty=turnover,
+                sector_map=sector_map or {},
             )
         except Exception as exc:
             st.error(f"Optimizer error: {exc}")
@@ -78,6 +93,22 @@ def _render_optimizer_tab(
         st.metric("Expected Return", f"{result.expected_return * 100:.1f}%")
         st.metric("Volatility", f"{result.expected_vol * 100:.1f}%")
         st.metric("Sharpe", f"{result.sharpe:.2f}")
+        st.caption(f"rf = {result.risk_free_rate * 100:.1f}%")
+
+    # Constraint status — always visible so the reader knows what bounds were active
+    with st.expander("Constraints & inputs", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Position cap", f"{result.max_position_weight * 100:.0f}%")
+        c2.metric("Sector cap", f"{result.max_sector_weight * 100:.0f}%")
+        c3.metric("Turnover penalty", f"{result.turnover_penalty:.2f}")
+        if result.binding_constraints:
+            st.warning("**Binding:** " + " · ".join(result.binding_constraints))
+        else:
+            st.success("No constraints binding — weights are unconstrained optima.")
+        st.caption(
+            f"Lookback: {result.lookback_days}d · Covariance: Ledoit-Wolf shrinkage · "
+            f"n={len(result.tickers)} assets (small matrix — treat weights as estimates, not precise allocations)"
+        )
 
     st.subheader("Sensitivity — how weights move when expected returns are shocked ±2%")
     st.caption(
@@ -277,12 +308,52 @@ def render_portfolio_analysis_page() -> None:
     tv = sum(h.market_value or 0 for h in priced_eq)
     current_weights = [(h.market_value or 0) / tv if tv > 0 else 1.0 / len(priced_eq)
                        for h in priced_eq]
+    sector_map: dict[str, str] = {h.ticker: (h.sector or "Unknown") for h in priced_eq}
 
     if len(eq_tickers) < 2:
         st.warning("Need at least 2 priced equity positions to run optimizer.")
         return
 
-    holdings_hash = _holdings_hash(eq_tickers, current_weights)
+    # Constraint controls — changing a slider busts the session-state cache via the hash
+    with st.expander("Optimizer constraints", expanded=False):
+        n_eq = len(eq_tickers)
+        min_feasible_pct = max(5, int(100 / n_eq))  # smallest cap that keeps sum-to-1 feasible
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            max_pos = st.slider(
+                "Max position weight",
+                min_value=min_feasible_pct,
+                max_value=100,
+                value=40,
+                step=5,
+                format="%d%%",
+                key="opt_max_pos",
+                help=f"Per-stock upper bound. Min feasible with {n_eq} stocks is {min_feasible_pct}%.",
+            ) / 100.0
+        with cc2:
+            max_sec = st.slider(
+                "Max sector weight",
+                min_value=min_feasible_pct,
+                max_value=100,
+                value=60,
+                step=5,
+                format="%d%%",
+                key="opt_max_sec",
+                help="Upper bound on total weight allocated to any single GICS sector.",
+            ) / 100.0
+        with cc3:
+            turnover = st.slider(
+                "Turnover penalty",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.0,
+                step=0.05,
+                format="%.2f",
+                key="opt_turnover",
+                help="L1 penalty on |proposed − current| added to the objective. 0 = unconstrained turnover.",
+            )
+
+    holdings_hash = _holdings_hash(eq_tickers, current_weights, max_pos, max_sec, turnover)
 
     st.subheader("Optimizer")
     opt_tabs = st.tabs(["Max Sharpe", "Min Vol", "Risk Parity"])
@@ -293,11 +364,20 @@ def render_portfolio_analysis_page() -> None:
 
     with _opt_ctx:
         with opt_tabs[0]:
-            _render_optimizer_tab("max_sharpe", eq_tickers, current_weights, holdings_hash)
+            _render_optimizer_tab(
+                "max_sharpe", eq_tickers, current_weights, holdings_hash,
+                sector_map=sector_map, max_pos=max_pos, max_sec=max_sec, turnover=turnover,
+            )
         with opt_tabs[1]:
-            _render_optimizer_tab("min_vol", eq_tickers, current_weights, holdings_hash)
+            _render_optimizer_tab(
+                "min_vol", eq_tickers, current_weights, holdings_hash,
+                sector_map=sector_map, max_pos=max_pos, max_sec=max_sec, turnover=turnover,
+            )
         with opt_tabs[2]:
-            _render_optimizer_tab("risk_parity", eq_tickers, current_weights, holdings_hash)
+            _render_optimizer_tab(
+                "risk_parity", eq_tickers, current_weights, holdings_hash,
+                sector_map=sector_map, max_pos=max_pos, max_sec=max_sec, turnover=turnover,
+            )
 
     st.divider()
     st.subheader("Monte Carlo Simulation")

@@ -37,6 +37,12 @@ class OptimizeResult:
     risk_free_rate: float
     lookback_days: int
     risk_contributions: list[float]  # each ticker's fractional risk contribution
+    # Constraint params and which ones bound
+    max_position_weight: float = 1.0
+    max_sector_weight: float = 1.0
+    turnover_penalty: float = 0.0
+    binding_constraints: list[str] = field(default_factory=list)
+    sector_map: dict[str, str] = field(default_factory=dict)
     # Sensitivity: expected-return shocks → weight changes
     sensitivity: list[SensitivityRow] = field(default_factory=list)
     # Legacy dict kept for the existing UI table; populated from sensitivity rows
@@ -97,14 +103,62 @@ def _sharpe(w: np.ndarray, mu: np.ndarray, cov: np.ndarray, rf: float) -> float:
     return (port_ret - rf) / port_vol
 
 
-def _max_sharpe(mu: np.ndarray, cov: np.ndarray, rf: float) -> np.ndarray:
+def _build_constraints_and_bounds(
+    n: int,
+    valid_tickers: list[str],
+    max_position_weight: float,
+    max_sector_weight: float,
+    sector_map: dict[str, str],
+    min_position: float = 0.0,
+) -> tuple[list[tuple[float, float]], list[dict]]:
+    """Build SLSQP bounds + constraint list.
+
+    Ensures the position cap is at least 1/n so the sum-to-one constraint is
+    always feasible (e.g. 20% cap with 4 stocks would be infeasible at 4×20%=80%).
+    """
+    min_feasible = 1.0 / n
+    effective_max = max(max_position_weight, min_feasible)
+    if effective_max > max_position_weight + 1e-6:
+        logger.info(
+            "Position cap %.0f%% relaxed to %.0f%% to keep sum-to-one feasible with %d assets.",
+            max_position_weight * 100, effective_max * 100, n,
+        )
+
+    bounds = [(min_position, effective_max)] * n
+    constraints: list[dict] = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+
+    if sector_map:
+        from collections import defaultdict
+        sector_to_idx: dict[str, list[int]] = defaultdict(list)
+        for i, t in enumerate(valid_tickers):
+            sector_to_idx[sector_map.get(t, "Unknown")].append(i)
+        for indices in sector_to_idx.values():
+            if len(indices) >= 2:
+                constraints.append({
+                    "type": "ineq",
+                    "fun": lambda w, idx=indices: max_sector_weight - sum(w[i] for i in idx),
+                })
+
+    return bounds, constraints
+
+
+def _max_sharpe(
+    mu: np.ndarray,
+    cov: np.ndarray,
+    rf: float,
+    bounds: list[tuple[float, float]],
+    constraints: list[dict],
+    current_w: Optional[np.ndarray] = None,
+    turnover_penalty: float = 0.0,
+) -> np.ndarray:
     n = len(mu)
     w0 = np.ones(n) / n
-    bounds = [(0.0, 1.0)] * n
-    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
 
     def neg_sharpe(w):
-        return -_sharpe(w, mu, cov, rf)
+        obj = -_sharpe(w, mu, cov, rf)
+        if turnover_penalty > 0.0 and current_w is not None:
+            obj += turnover_penalty * float(np.sum(np.abs(w - current_w)))
+        return obj
 
     res = minimize(neg_sharpe, w0, method="SLSQP", bounds=bounds, constraints=constraints,
                    options={"maxiter": 1000, "ftol": 1e-9})
@@ -114,14 +168,21 @@ def _max_sharpe(mu: np.ndarray, cov: np.ndarray, rf: float) -> np.ndarray:
     return res.x
 
 
-def _min_vol(cov: np.ndarray) -> np.ndarray:
+def _min_vol(
+    cov: np.ndarray,
+    bounds: list[tuple[float, float]],
+    constraints: list[dict],
+    current_w: Optional[np.ndarray] = None,
+    turnover_penalty: float = 0.0,
+) -> np.ndarray:
     n = cov.shape[0]
     w0 = np.ones(n) / n
-    bounds = [(0.0, 1.0)] * n
-    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
 
     def port_vol(w):
-        return np.sqrt(w @ cov @ w)
+        obj = np.sqrt(w @ cov @ w)
+        if turnover_penalty > 0.0 and current_w is not None:
+            obj += turnover_penalty * float(np.sum(np.abs(w - current_w)))
+        return obj
 
     res = minimize(port_vol, w0, method="SLSQP", bounds=bounds, constraints=constraints,
                    options={"maxiter": 1000, "ftol": 1e-9})
@@ -131,34 +192,40 @@ def _min_vol(cov: np.ndarray) -> np.ndarray:
     return res.x
 
 
-def _risk_parity(cov: np.ndarray) -> np.ndarray:
+def _risk_parity(
+    cov: np.ndarray,
+    bounds: list[tuple[float, float]],
+    constraints: list[dict],
+    current_w: Optional[np.ndarray] = None,
+    turnover_penalty: float = 0.0,
+) -> np.ndarray:
     """True risk parity: equalize each asset's marginal risk contribution.
 
     Solves min Σ(RC_i - target)² subject to Σw=1, w≥0, where
     RC_i = w_i * (Σw)_i is asset i's risk contribution.
-
-    The previous implementation used inverse-vol weighting which only
-    accounts for individual volatilities and ignores pairwise correlations.
     """
     n = cov.shape[0]
     w0 = np.ones(n) / n
 
     def _risk_contributions(w: np.ndarray) -> np.ndarray:
-        port_vol = np.sqrt(w @ cov @ w)
-        if port_vol < 1e-12:
+        pv = np.sqrt(w @ cov @ w)
+        if pv < 1e-12:
             return np.ones(n) / n
-        mrc = (cov @ w) / port_vol   # marginal risk contributions
-        return w * mrc               # risk contributions
+        mrc = (cov @ w) / pv
+        return w * mrc
 
     def objective(w: np.ndarray) -> float:
         rc = _risk_contributions(w)
-        target = rc.sum() / n        # equal share of total portfolio risk
-        return float(np.sum((rc - target) ** 2))
+        target = rc.sum() / n
+        obj = float(np.sum((rc - target) ** 2))
+        if turnover_penalty > 0.0 and current_w is not None:
+            obj += turnover_penalty * float(np.sum(np.abs(w - current_w)))
+        return obj
 
-    bounds = [(1e-4, 1.0)] * n
-    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+    # Risk parity needs a strictly positive lower bound for the risk-contribution gradient to be defined
+    rp_bounds = [(max(b[0], 1e-4), b[1]) for b in bounds]
 
-    res = minimize(objective, w0, method="SLSQP", bounds=bounds, constraints=constraints,
+    res = minimize(objective, w0, method="SLSQP", bounds=rp_bounds, constraints=constraints,
                    options={"maxiter": 2000, "ftol": 1e-12})
     if not res.success:
         logger.warning("risk_parity did not converge: %s. Falling back to inverse-vol.", res.message)
@@ -189,27 +256,32 @@ def _compute_sensitivity(
     rf: float,
     method: str,
     delta: float = 0.02,
+    bounds: Optional[list[tuple[float, float]]] = None,
+    constraints: Optional[list[dict]] = None,
+    current_w: Optional[np.ndarray] = None,
+    turnover_penalty: float = 0.0,
 ) -> tuple[list[SensitivityRow], dict[str, tuple[float, float]]]:
     """Shock each holding's expected return ±delta, report weight changes.
 
-    At a portfolio optimum, first-order weight sensitivity ≈ 0 (the old
-    approach of bumping weights and measuring Sharpe impact was uninformative
-    by construction). The fragile input is the expected-return estimate, so
-    we shock that instead.
-
-    Returns (rows, legacy_dict) where legacy_dict matches the old API shape
-    so the existing UI sensitivity table continues to render.
+    Re-optimizes with the same constraints as the original run so sensitivity
+    rows reflect constrained responses, not unconstrained corner solutions.
     """
+    n = len(tickers)
+    if bounds is None:
+        bounds = [(0.0, 1.0)] * n
+    if constraints is None:
+        constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+
     rows: list[SensitivityRow] = []
     legacy: dict[str, tuple[float, float]] = {}
 
     def _reoptimize(mu_shocked: np.ndarray) -> np.ndarray:
         if method == "max_sharpe":
-            w = _max_sharpe(mu_shocked, cov, rf)
+            w = _max_sharpe(mu_shocked, cov, rf, bounds, constraints, current_w, turnover_penalty)
         elif method == "min_vol":
-            w = _min_vol(cov)
+            w = _min_vol(cov, bounds, constraints, current_w, turnover_penalty)
         elif method == "risk_parity":
-            w = _risk_parity(cov)
+            w = _risk_parity(cov, bounds, constraints, current_w, turnover_penalty)
         else:
             return proposed_weights.copy()
         w = np.clip(w, 0.0, 1.0)
@@ -244,6 +316,10 @@ def optimize_portfolio(
     risk_free_rate: float = 0.05,
     lookback_days: int = 252,
     sensitivity_delta: float = 0.02,
+    max_position_weight: float = 0.40,
+    max_sector_weight: float = 0.60,
+    turnover_penalty: float = 0.0,
+    sector_map: Optional[dict[str, str]] = None,
 ) -> OptimizeResult:
     if len(tickers) < 2:
         raise ValueError("At least 2 tickers required for optimization.")
@@ -261,28 +337,54 @@ def optimize_portfolio(
     else:
         valid_current = np.ones(len(valid_tickers)) / len(valid_tickers)
 
+    sm = sector_map or {}
     returns_arr = returns_df[valid_tickers].values
     mu = returns_arr.mean(axis=0) * 252
     cov = _ledoit_wolf_cov(returns_arr)
 
+    bounds, constraints = _build_constraints_and_bounds(
+        len(valid_tickers), valid_tickers,
+        max_position_weight, max_sector_weight, sm,
+    )
+
     if method == "max_sharpe":
-        proposed = _max_sharpe(mu, cov, risk_free_rate)
+        proposed = _max_sharpe(mu, cov, risk_free_rate, bounds, constraints, valid_current, turnover_penalty)
     elif method == "min_vol":
-        proposed = _min_vol(cov)
+        proposed = _min_vol(cov, bounds, constraints, valid_current, turnover_penalty)
     elif method == "risk_parity":
-        proposed = _risk_parity(cov)
+        proposed = _risk_parity(cov, bounds, constraints, valid_current, turnover_penalty)
     else:
         raise ValueError(f"Unknown method: {method}")
 
     proposed = np.clip(proposed, 0.0, 1.0)
     proposed /= proposed.sum()
 
+    # Detect binding constraints: positions at their upper bound
+    effective_max = max(max_position_weight, 1.0 / len(valid_tickers))
+    binding: list[str] = []
+    for i, t in enumerate(valid_tickers):
+        if proposed[i] >= effective_max - 1e-3:
+            binding.append(f"{t} at position cap ({effective_max * 100:.0f}%)")
+
+    if sm:
+        from collections import defaultdict
+        sector_to_idx: dict[str, list[int]] = defaultdict(list)
+        for i, t in enumerate(valid_tickers):
+            sector_to_idx[sm.get(t, "Unknown")].append(i)
+        for sector, indices in sector_to_idx.items():
+            if len(indices) >= 2:
+                sw = sum(proposed[i] for i in indices)
+                if sw >= max_sector_weight - 1e-3:
+                    binding.append(f"{sector} sector at cap ({max_sector_weight * 100:.0f}%)")
+
     exp_ret = float(mu @ proposed)
     exp_vol = float(np.sqrt(proposed @ cov @ proposed))
     sharpe = _sharpe(proposed, mu, cov, risk_free_rate)
 
     sensitivity_rows, sensitivity_legacy = _compute_sensitivity(
-        valid_tickers, proposed, mu, cov, risk_free_rate, method, sensitivity_delta
+        valid_tickers, proposed, mu, cov, risk_free_rate, method, sensitivity_delta,
+        bounds=bounds, constraints=constraints,
+        current_w=valid_current, turnover_penalty=turnover_penalty,
     )
 
     # Correlation matrix from cov
@@ -306,6 +408,11 @@ def optimize_portfolio(
         risk_free_rate=risk_free_rate,
         lookback_days=lookback_days,
         risk_contributions=rc.tolist(),
+        max_position_weight=effective_max,
+        max_sector_weight=max_sector_weight,
+        turnover_penalty=turnover_penalty,
+        binding_constraints=binding,
+        sector_map=sm,
         sensitivity=sensitivity_rows,
         sensitivity_legacy=sensitivity_legacy,
     )
@@ -323,14 +430,30 @@ def _build_optimizer_payload(result: OptimizeResult, method: str) -> str:
             pairs.append((result.tickers[i], result.tickers[j], corr[i][j]))
     pairs.sort(key=lambda x: abs(x[2]), reverse=True)
 
+    # Sector groupings for payload
+    sector_to_tickers: dict[str, list[str]] = {}
+    if result.sector_map:
+        for t in result.tickers:
+            s = result.sector_map.get(t, "Unknown")
+            sector_to_tickers.setdefault(s, []).append(t)
+
+    proposed_arr = np.array(result.proposed_weights)
     payload = {
         "method": method,
         "risk_free_rate_pct": round(result.risk_free_rate * 100, 2),
         "lookback_days": result.lookback_days,
+        "covariance_shrinkage": "Ledoit-Wolf",
         "n_assets": n,
+        "constraints": {
+            "max_position_pct": round(result.max_position_weight * 100, 1),
+            "max_sector_pct": round(result.max_sector_weight * 100, 1),
+            "turnover_penalty": round(result.turnover_penalty, 3),
+            "binding": result.binding_constraints,
+        },
         "holdings": [
             {
                 "ticker": t,
+                "sector": result.sector_map.get(t, "Unknown"),
                 "expected_return_pct": round(result.mu[i] * 100, 2),
                 "vol_pct": round(result.vols[i] * 100, 2),
                 "current_weight_pct": round(result.current_weights[i] * 100, 2),
@@ -340,6 +463,7 @@ def _build_optimizer_payload(result: OptimizeResult, method: str) -> str:
                 ),
                 "risk_contribution_pct": round(result.risk_contributions[i] * 100, 2),
                 "weight_x_return": round(result.proposed_weights[i] * result.mu[i] * 100, 2),
+                "at_position_cap": bool(proposed_arr[i] >= result.max_position_weight - 1e-3),
             }
             for i, t in enumerate(result.tickers)
         ],
@@ -347,7 +471,15 @@ def _build_optimizer_payload(result: OptimizeResult, method: str) -> str:
             "expected_return_pct": round(result.expected_return * 100, 2),
             "vol_pct": round(result.expected_vol * 100, 2),
             "sharpe": round(result.sharpe, 4),
+            "sharpe_formula": (
+                f"({round(result.expected_return*100,2)}% - {round(result.risk_free_rate*100,2)}%) "
+                f"/ {round(result.expected_vol*100,2)}% = {round(result.sharpe, 4)}"
+            ),
         },
+        "sector_weights": {
+            s: round(sum(result.proposed_weights[result.tickers.index(t)] for t in ts) * 100, 1)
+            for s, ts in sector_to_tickers.items()
+        } if sector_to_tickers else {},
         "correlation_pairs": [
             {"pair": f"{a}/{b}", "corr": round(c, 3)} for a, b, c in pairs
         ],
@@ -393,14 +525,24 @@ or figures that are not in the JSON. If a number seems high relative to long-run
 
 Structure your response as:
 ## Inputs
+## Active Constraints
 ## The Arithmetic
 ## Why Each Weight Moved
 ## Dominant Assumption
 ## Plausibility Check
 ## What Would Change the Recommendation
 
-Keep each section concise (2–4 sentences). Be direct; name numbers; do not hedge with "may" or
-"could" unless genuinely uncertain about the data source.
+Guidelines:
+- In "Inputs": state the risk-free rate, lookback window, and shrinkage method explicitly.
+- In "Active Constraints": name the position cap and sector cap; name any binding constraints
+  (weights at their limit); if no constraint bound, say so.
+- In "The Arithmetic": show weight × expected_return per holding summing to portfolio E[r],
+  then Sharpe using the exact formula in sharpe_formula.
+- In "Why Each Weight Moved": cover every holding. If a weight is zero or at its cap,
+  say whether that is a genuine optimizer preference or a constraint forcing it.
+- In "Plausibility Check": compare portfolio expected return to the long-run baseline.
+  If the portfolio E[r] is more than double the baseline, name the holding driving it.
+- Keep each section to 2–4 sentences. Be direct; name numbers.
 """)
 
     messages = [
