@@ -180,8 +180,11 @@ def _render_portfolio_editor(portfolio_id: int, portfolio_name: str) -> Optional
 
 
 def _render_portfolio_analysis(portfolio: Portfolio) -> None:
-    st.markdown(f"### {portfolio.name}")
-    st.caption(f"Total value: ${portfolio.total_value:,.0f}")
+    col_title, col_value = st.columns([3, 1])
+    with col_title:
+        st.markdown(f"### {portfolio.name}")
+    with col_value:
+        st.metric("Portfolio Value", f"${portfolio.total_value:,.0f}")
 
     # Main holdings table
     df = portfolio.to_dataframe()
@@ -201,6 +204,13 @@ def _render_portfolio_analysis(portfolio: Portfolio) -> None:
     for col in ["Market Value", "Unrealized P&L", "Unrealized P&L %", "Weight", "Price", "Cost Basis"]:
         if col in display_df.columns:
             display_df[col] = _fmt(col, df)
+
+    # Rename columns to eliminate ambiguity: "Weight" has no denominator, "Market Value"
+    # sounds like the market's total value rather than the position's value.
+    display_df = display_df.rename(columns={
+        "Market Value": "Position Value",
+        "Weight": "Portfolio Weight",
+    })
 
     st.dataframe(display_df, hide_index=True, use_container_width=True)
 
