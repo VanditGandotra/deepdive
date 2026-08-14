@@ -3,12 +3,26 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterator, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Build stamp — computed once at module load so it survives Streamlit reruns.
+def _build_stamp() -> str:
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except Exception:
+        sha = "unknown"
+    return sha
+
+_BUILD_SHA = _build_stamp()
 
 import streamlit as st
 from core.text_render import render_md, sanitize_markdown
@@ -95,6 +109,16 @@ def tab_overview(ticker: str, settings: Dict) -> None:
     except Exception as exc:
         error_card("Market data unavailable", str(exc))
         return
+
+    # Staleness banner: show warning if data came from expired cache
+    from data.cache import get_freshness
+    _freshness = get_freshness(f"market:{ticker}:fundamentals")
+    if _freshness and _freshness.get("is_stale"):
+        st.warning(
+            f"⚠ Market data is stale (last fetched {_freshness['age_description']}). "
+            "All providers are currently rate-limited — displaying cached data. "
+            "Data will refresh automatically when providers recover."
+        )
 
     si = quality = call_data = dcf_for_sop = ratio_groups = None
     bm: List = []
@@ -501,44 +525,61 @@ def tab_earnings_calls(ticker: str, settings: Dict) -> None:
         from data.transcripts import get_transcript_provider_outcomes
         outcomes = get_transcript_provider_outcomes(ticker)
 
-        # Classify: if at least one provider returned "not_found" across all quarters,
-        # the transcripts genuinely don't exist for the requested range.
-        # If every available provider errored/was blocked, that's a fetch failure.
         had_not_found = any(o.get("status") == "not_found" for o in outcomes)
         had_ok_provider = any(o.get("status") == "ok" for o in outcomes)
-        all_no_key = outcomes and all(o.get("status") == "no_key" for o in outcomes)
+        had_error = any(o.get("status") in ("error", "unavailable") for o in outcomes)
+        keyed_providers = [o for o in outcomes if o.get("status") != "no_key"]
+        all_no_key = outcomes and not keyed_providers
 
-        if all_no_key:
+        if all_no_key or not outcomes:
             st.warning(
-                f"No transcript providers are configured for **{ticker}**. "
-                "Add a free **FMP_API_KEY** (financialmodelingprep.com) to your "
-                "**Streamlit Cloud → App settings → Secrets** box."
+                f"No transcript providers are configured. "
+                "**Next step:** add `FMP_API_KEY` to **Streamlit Cloud → App settings → Secrets** "
+                "— it's free at financialmodelingprep.com (250 req/day, covers most US tickers)."
             )
-        elif had_not_found and not had_ok_provider:
+        elif had_not_found and not had_ok_provider and not had_error:
+            # At least one keyed provider searched and found nothing
             st.info(
-                f"No transcripts found for **{ticker}** in the last 8 quarters "
-                "across all configured providers."
+                f"No {ticker} transcripts found in the last 8 quarters — "
+                "keyed providers searched and returned zero results. "
+                "This means transcripts may not be available for this ticker through these providers, "
+                "or the ticker is non-US and not covered."
+            )
+        elif had_error and not had_ok_provider:
+            # Providers were configured but all failed (403, timeout, scrape blocked)
+            st.warning(
+                f"Transcript fetch failed for **{ticker}** — configured providers returned transport "
+                "errors or were blocked (HTTP 403/429 is common from shared cloud IPs). "
+                "This is a **fetch failure**, not evidence that transcripts don't exist. "
+                "Retry, or add a keyed provider such as FMP_API_KEY."
             )
         else:
             st.warning(
-                f"Transcript fetch incomplete for **{ticker}** — providers returned errors "
-                "or were blocked (common from shared cloud IPs). "
-                "Add **FMP_API_KEY** to Streamlit Cloud Secrets for a keyed API fallback."
+                f"Transcript fetch incomplete for **{ticker}** — some providers searched, some errored. "
+                "See details below."
             )
 
+        _STATUS_ICON = {
+            "ok": "✅", "not_found": "🔍", "no_key": "🔑",
+            "unavailable": "🚫", "error": "⚠️",
+        }
         if outcomes:
-            _STATUS_ICON = {
-                "ok": "✅", "not_found": "🔍", "no_key": "🔑",
-                "unavailable": "🚫", "error": "⚠️",
-            }
-            with st.expander("Provider details", expanded=False):
+            with st.expander("Provider details", expanded=True):
                 for o in outcomes:
                     icon = _STATUS_ICON.get(o["status"], "❓")
-                    detail = f" — {o['detail']}" if o.get("detail") else ""
-                    st.caption(f"{icon} **{o['provider']}**: {o['status']}{detail}")
+                    parts = [f"{icon} **{o['provider']}**: {o['status']}"]
+                    if o.get("symbol_used") and o["symbol_used"] != ticker.upper():
+                        parts.append(f"(queried as `{o['symbol_used']}`)")
+                    if o.get("latency_ms") is not None:
+                        parts.append(f"{o['latency_ms']}ms")
+                    if o.get("chars"):
+                        parts.append(f"{o['chars']:,} chars")
+                    if o.get("detail"):
+                        parts.append(f"— {o['detail']}")
+                    st.caption("  ".join(parts))
                 st.caption(
-                    "🔑 = no API key · 🔍 = searched, no results · "
-                    "🚫 = auth/plan required · ⚠️ = network error · ✅ = success"
+                    "🔑 no key · 🔍 searched, not found · "
+                    "🚫 auth/plan required · ⚠️ network error · ✅ success"
                 )
         return
 
@@ -1177,20 +1218,47 @@ def run_ticker_mode(ticker: str, settings: Dict) -> None:
     # ── Provider diagnostics (collapsed) ──────────────────────────────────────
     from data.market import get_provider_health
     from data.transcripts import get_transcript_provider_outcomes
+    import data.market as _mkt_mod
+    import config as _diag_cfg
     mkt_health = get_provider_health()
     tx_outcomes = get_transcript_provider_outcomes(ticker)
-    if mkt_health or tx_outcomes:
-        with st.expander("📡 Provider diagnostics", expanded=False):
-            if mkt_health:
-                st.markdown("**Market data (yfinance/Yahoo Finance)**")
-                for t, h in mkt_health.items():
-                    status = h.get("status", "unknown")
-                    icon = "✅" if status == "ok" else "⚠️"
-                    detail = h.get("detail", "")
-                    n = h.get("fields")
-                    info_str = f"{n} fields" if n else detail
-                    st.caption(f"{icon} **{t}**: {status} — {info_str}")
-            if tx_outcomes:
+    with st.expander("📡 Provider diagnostics", expanded=False):
+        # Build stamp — always visible so deploys are verifiable
+        st.caption(f"Build: `{_BUILD_SHA}` · {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}")
+
+        # Provider chain: configured status regardless of whether a fetch has run
+        st.markdown("**Provider chain (market data)**")
+        _CB_ICONS = {"closed": "🟢", "half-open": "🟡", "open": "🔴"}
+        _chain_rows = [
+            ("yfinance", "no key needed", True,            _mkt_mod._CB_YFINANCE),
+            ("fmp",      "FMP_API_KEY",   bool(_diag_cfg.FMP_API_KEY), _mkt_mod._CB_FMP),
+            ("stooq",    "no key needed", True,            _mkt_mod._CB_STOOQ),
+        ]
+        for pname, key_desc, has_cred, cb_obj in _chain_rows:
+            cred_icon = "🔑" if has_cred else "🚫"
+            cred_label = "key set" if has_cred else f"missing ({key_desc})"
+            state = cb_obj.state()
+            cb_icon = _CB_ICONS.get(state, "❓")
+            st.caption(f"  {cred_icon} **{pname}** — {cred_label}  ·  CB {cb_icon} {state}")
+
+        # Per-ticker last-fetch outcome (only after a fetch has run this session)
+        if mkt_health:
+            st.markdown("**Last fetch outcome**")
+            for t, h in mkt_health.items():
+                status = h.get("status", "unknown")
+                source = h.get("source", "?")
+                detail = h.get("detail", "")
+                cb_state = h.get("cb_state", "")
+                icon = "✅" if status == "ok" else ("🕐" if status == "stale" else "⚠️")
+                cb_icon = _CB_ICONS.get(cb_state, "") if cb_state else ""
+                parts = [f"{icon} **{t}** via {source}: {status}"]
+                if cb_icon:
+                    parts.append(f"CB {cb_icon} {cb_state}")
+                if detail:
+                    parts.append(f"— {detail}")
+                st.caption("  ".join(parts))
+
+        if tx_outcomes:
                 st.markdown("**Transcript providers**")
                 _STATUS_ICON = {
                     "ok": "✅", "not_found": "🔍", "no_key": "🔑",
@@ -1198,8 +1266,16 @@ def run_ticker_mode(ticker: str, settings: Dict) -> None:
                 }
                 for o in tx_outcomes:
                     icon = _STATUS_ICON.get(o["status"], "❓")
-                    detail = f" — {o['detail']}" if o.get("detail") else ""
-                    st.caption(f"{icon} **{o['provider']}**: {o['status']}{detail}")
+                    parts = [f"{icon} **{o['provider']}**: {o['status']}"]
+                    if o.get("symbol_used") and o["symbol_used"] != ticker.upper():
+                        parts.append(f"(as `{o['symbol_used']}`)")
+                    if o.get("latency_ms") is not None:
+                        parts.append(f"{o['latency_ms']}ms")
+                    if o.get("chars"):
+                        parts.append(f"{o['chars']:,} chars")
+                    if o.get("detail"):
+                        parts.append(f"— {o['detail']}")
+                    st.caption("  ".join(parts))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

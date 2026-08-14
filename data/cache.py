@@ -111,6 +111,17 @@ def get_cache_obj(key: str) -> Optional[Any]:
         return raw
 
 
+def get_stale_cache_obj(key: str) -> "Optional[tuple[Any, float]]":
+    """Return (deserialized_value, expires_at) regardless of expiry. None if key never set."""
+    row = _conn().execute("SELECT value, expires_at FROM cache WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row["value"]), row["expires_at"]
+    except json.JSONDecodeError:
+        return row["value"], row["expires_at"]
+
+
 def set_cache_obj(key: str, value: Any, ttl: int, source: str = "") -> None:
     set_cache(key, json.dumps(value, default=str), ttl, source)
 

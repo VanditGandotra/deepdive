@@ -6,20 +6,41 @@ load_dotenv()
 
 ROOT = Path(__file__).parent
 
+
+def _secret(key: str, default: str = "") -> str:
+    """Read a secret: st.secrets first (Streamlit Cloud UI), then os.environ (.env / shell).
+
+    Streamlit Cloud injects secrets as env vars automatically, so os.getenv usually
+    works there. This helper adds an explicit st.secrets lookup as belt-and-suspenders
+    so keys set in the UI are never missed even if the env-var injection is delayed.
+    """
+    val = os.getenv(key, "")
+    if val:
+        return val
+    try:
+        import streamlit as st
+        val = st.secrets.get(key, "")  # type: ignore[union-attr]
+        if val:
+            return str(val)
+    except Exception:
+        pass
+    return default
+
+
 # ── Models ──────────────────────────────────────────────────────────────────
 HAIKU = "claude-haiku-4-5-20251001"
 SONNET = "claude-sonnet-4-6"
 
 # ── API Keys ─────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-API_NINJAS_KEY = os.getenv("API_NINJAS_KEY", "")
-API_NINJAS_PREMIUM = os.getenv("API_NINJAS_PREMIUM", "").lower() == "true"
-ROIC_API_KEY = os.getenv("ROIC_API_KEY", "")
-FMP_API_KEY = os.getenv("FMP_API_KEY", "")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
-PRODUCT_HUNT_TOKEN = os.getenv("PRODUCT_HUNT_TOKEN", "")
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
-EDGAR_USER_AGENT = os.getenv("EDGAR_USER_AGENT", "DeepDive Research vandit@deductive.ai")
+ANTHROPIC_API_KEY = _secret("ANTHROPIC_API_KEY")
+API_NINJAS_KEY = _secret("API_NINJAS_KEY")
+API_NINJAS_PREMIUM = _secret("API_NINJAS_PREMIUM").lower() == "true"
+ROIC_API_KEY = _secret("ROIC_API_KEY")
+FMP_API_KEY = _secret("FMP_API_KEY")
+FINNHUB_API_KEY = _secret("FINNHUB_API_KEY")
+PRODUCT_HUNT_TOKEN = _secret("PRODUCT_HUNT_TOKEN")
+NEWSAPI_KEY = _secret("NEWSAPI_KEY")
+EDGAR_USER_AGENT = _secret("EDGAR_USER_AGENT", "DeepDive Research vandit@deductive.ai")
 
 # ── Storage ──────────────────────────────────────────────────────────────────
 DB_PATH = ROOT / os.getenv("DEEPDIVE_DB_PATH", "cache.db")
@@ -91,6 +112,10 @@ API_NINJAS_TRANSCRIPT_URL    = "https://api.api-ninjas.com/v1/earningstranscript
 ROIC_TRANSCRIPT_LIST_URL     = "https://roic.ai/v3.0.0/earnings-calls"
 ROIC_TRANSCRIPT_DETAIL_URL   = "https://roic.ai/v3.0.0/earnings-calls/{ecall_id}"
 FMP_TRANSCRIPT_URL           = "https://financialmodelingprep.com/api/v3/earning_call_transcript/{symbol}"
+FMP_PROFILE_URL              = "https://financialmodelingprep.com/api/v3/profile/{symbol}"
+FMP_QUOTE_URL                = "https://financialmodelingprep.com/api/v3/quote/{symbol}"
+FMP_KEY_METRICS_TTM_URL      = "https://financialmodelingprep.com/api/v3/key-metrics-ttm/{symbol}"
+STOOQ_PRICE_URL              = "https://stooq.com/q/d/l/?s={ticker}.us&i=d"
 FINNHUB_TRANSCRIPT_LIST_URL  = "https://finnhub.io/api/v1/stock/transcripts/list"
 FINNHUB_TRANSCRIPT_URL       = "https://finnhub.io/api/v1/stock/transcripts"
 

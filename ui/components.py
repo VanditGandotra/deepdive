@@ -389,11 +389,8 @@ def error_card(title: str, detail: str, tab_only: bool = True) -> None:
     with st.container(border=True):
         st.error(f"**{title}**")
         st.caption(detail)
-        if tab_only:
-            st.caption("Other tabs are unaffected.")
 
 
 def unavailable_tab(source: str, reason: str) -> None:
     st.warning(f"**{source} unavailable**")
     st.caption(reason)
-    st.caption("Freshness badges for other tabs are still accurate.")

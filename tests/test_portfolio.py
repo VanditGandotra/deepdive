@@ -350,3 +350,81 @@ class TestEnrichmentResult:
         result = enrich_with_prices(pf)
         assert result.failed == []
         assert result.portfolio.holdings[0].market_value == pytest.approx(5000.0)
+
+
+# ── Tests: Partial-data correctness (AMZN regression) ─────────────────────────
+
+class TestPartialDataFixes:
+    """Regression suite for the AMZN/partial-portfolio correctness bugs."""
+
+    def test_failed_holding_weight_is_none(self) -> None:
+        """Failed ticker weight must be None — not 0.0 silently renormalized away."""
+        pf = Portfolio(name="T", holdings=[
+            Holding(ticker="AMD", shares=10),
+            Holding(ticker="AMZN", shares=5),
+        ])
+
+        def fake_get(ticker):
+            if ticker == "AMZN":
+                raise RuntimeError("rate limited")
+            m = MagicMock()
+            m.current_price = 100.0
+            m.sector = "Technology"
+            return m
+
+        with patch("data.market.get_fundamentals", side_effect=fake_get):
+            result = enrich_with_prices(pf)
+
+        amzn = next(h for h in result.portfolio.holdings if h.ticker == "AMZN")
+        amd = next(h for h in result.portfolio.holdings if h.ticker == "AMD")
+        assert amzn.weight is None, "Failed holding must have weight=None, not 0.0"
+        assert amd.weight == pytest.approx(1.0)   # 100% of the priced portion
+        assert "AMZN" in result.failed
+
+    def test_fetch_errors_include_exception_detail(self) -> None:
+        """fetch_errors must record ticker → 'ExcType: message' for every failure."""
+        pf = Portfolio(name="T", holdings=[Holding(ticker="AMZN", shares=5)])
+
+        with patch("data.market.get_fundamentals",
+                   side_effect=RuntimeError("Yahoo returned 0 fields")):
+            result = enrich_with_prices(pf)
+
+        assert "AMZN" in result.fetch_errors
+        assert "RuntimeError" in result.fetch_errors["AMZN"]
+
+    def test_failed_fetch_does_not_write_cache(self) -> None:
+        """_check_info raises before set_cache_obj is reached — cache must stay clean."""
+        with patch("data.cache.set_cache_obj") as mock_set, \
+             patch("data.cache.get_cache_obj", return_value=None), \
+             patch("data.cache.record_freshness"), \
+             patch("time.sleep"):   # suppress retry delays
+            mock_ticker = MagicMock()
+            mock_ticker.info = {}  # empty dict → _check_info raises SourceUnavailable
+            with patch("yfinance.Ticker", return_value=mock_ticker):
+                from data.market import get_fundamentals
+                with pytest.raises(Exception):
+                    get_fundamentals("_TEST_NO_CACHE_")
+
+        mock_set.assert_not_called()
+
+    def test_yfinance_session_injects_timeout(self) -> None:
+        """_yf_session must wrap every send with timeout=20 when caller omits it."""
+        from data.market import _yf_session
+        from requests.adapters import HTTPAdapter
+        import requests
+
+        captured: dict = {}
+
+        def fake_adapter_send(self_, request, **kwargs):
+            captured.update(kwargs)
+            raise ConnectionError("test stop")
+
+        with patch.object(HTTPAdapter, "send", fake_adapter_send):
+            session = _yf_session()
+            prep = requests.Request("GET", "http://example.invalid/").prepare()
+            try:
+                session.send(prep)
+            except Exception:
+                pass
+
+        assert captured.get("timeout") == 20

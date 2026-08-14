@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -10,9 +11,10 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 
+import config as _cfg
 from config import TTL_FUNDAMENTALS, TTL_NEWS, TTL_PRICES
-from data.cache import (get_cache_obj, record_freshness, set_cache_obj)
-from data.resilience import retry, SourceUnavailable
+from data.cache import (get_cache_obj, get_stale_cache_obj, record_freshness, set_cache_obj)
+from data.resilience import CircuitBreaker, retry, SourceUnavailable
 from analysis.schemas import (
     AnalystTarget, Fundamentals, InsiderTransaction,
     InstitutionalHolder, NewsItem, PriceBar, PriceData, ShortInterest,
@@ -21,6 +23,10 @@ from analysis.schemas import (
 logger = logging.getLogger(__name__)
 
 _PROVIDER_HEALTH: Dict[str, Any] = {}
+
+_CB_YFINANCE = CircuitBreaker("yfinance", failure_threshold=3, cooldown_secs=300.0)
+_CB_FMP      = CircuitBreaker("fmp",      failure_threshold=5, cooldown_secs=300.0)
+_CB_STOOQ    = CircuitBreaker("stooq",    failure_threshold=5, cooldown_secs=120.0)
 
 
 def _yf_session() -> "requests.Session":
@@ -77,44 +83,35 @@ def _safe_int(val: Any) -> Optional[int]:
         return None
 
 
-@retry(max_attempts=3, base_delay=2.0)
-def get_prices(ticker: str, period: str = "5y") -> PriceData:
-    cache_key = f"market:{ticker}:prices:{period}"
-    cached = get_cache_obj(cache_key)
-    if cached:
-        return PriceData.model_validate(cached)
-
+def _fetch_prices_yfinance(ticker: str, period: str = "5y") -> PriceData:
     yf_ticker = yf.Ticker(ticker, session=_yf_session())
     hist = yf_ticker.history(period=period, auto_adjust=True)
     if hist.empty:
         raise ValueError(f"No price data returned for {ticker}")
-
     bars = []
     for dt, row in hist.iterrows():
         bars.append(PriceBar(
             date=dt.date(),
-            open=float(row["Open"]),
-            high=float(row["High"]),
-            low=float(row["Low"]),
-            close=float(row["Close"]),
+            open=float(row["Open"]), high=float(row["High"]),
+            low=float(row["Low"]),  close=float(row["Close"]),
             volume=int(row.get("Volume", 0)),
         ))
-
     info = yf_ticker.fast_info
     currency = getattr(info, "currency", "USD") or "USD"
-    result = PriceData(ticker=ticker, currency=currency, bars=bars)
-    set_cache_obj(cache_key, result.model_dump(mode="json"), TTL_PRICES, source="yfinance")
-    record_freshness(cache_key, "yfinance", TTL_PRICES)
-    return result
+    return PriceData(ticker=ticker, currency=currency, bars=bars)
 
 
-@retry(max_attempts=3, base_delay=2.0)
-def get_fundamentals(ticker: str) -> Fundamentals:
-    cache_key = f"market:{ticker}:fundamentals"
-    cached = get_cache_obj(cache_key)
-    if cached:
-        return Fundamentals.model_validate(cached)
+def _fetch_price_stooq(ticker: str) -> float:
+    from data.providers.stooq import StooqProvider
+    return StooqProvider().get_price(ticker)
 
+
+def _fetch_fundamentals_fmp(ticker: str) -> Fundamentals:
+    from data.providers.fmp import FmpMarketProvider
+    return FmpMarketProvider().get_fundamentals(ticker)
+
+
+def _fetch_fundamentals_yfinance(ticker: str) -> Fundamentals:
     yf_ticker = yf.Ticker(ticker, session=_yf_session())
     info: Dict[str, Any] = yf_ticker.info or {}
     _check_info(info, ticker)
@@ -281,9 +278,112 @@ def get_fundamentals(ticker: str) -> Fundamentals:
     except Exception:
         pass
 
-    set_cache_obj(cache_key, result.model_dump(mode="json"), TTL_FUNDAMENTALS, source="yfinance")
-    record_freshness(cache_key, "yfinance", TTL_FUNDAMENTALS)
     return result
+
+
+def get_prices(ticker: str, period: str = "5y") -> PriceData:
+    cache_key = f"market:{ticker}:prices:{period}"
+    cached = get_cache_obj(cache_key)
+    if cached:
+        return PriceData.model_validate(cached)
+
+    last_exc: Optional[Exception] = None
+
+    if not _CB_YFINANCE.is_open:
+        try:
+            result = _fetch_prices_yfinance(ticker, period)
+            _CB_YFINANCE.record_success()
+            set_cache_obj(cache_key, result.model_dump(mode="json"), TTL_PRICES, source="yfinance")
+            record_freshness(cache_key, "yfinance", TTL_PRICES)
+            return result
+        except Exception as exc:
+            _CB_YFINANCE.record_failure()
+            last_exc = exc
+            logger.warning("yfinance prices failed for %s: %s", ticker, exc)
+
+    if not _CB_STOOQ.is_open:
+        try:
+            close = _fetch_price_stooq(ticker)
+            from datetime import date
+            result = PriceData(
+                ticker=ticker, currency="USD",
+                bars=[PriceBar(date=date.today(), open=close, high=close, low=close,
+                               close=close, volume=0)],
+            )
+            _CB_STOOQ.record_success()
+            set_cache_obj(cache_key, result.model_dump(mode="json"), TTL_PRICES, source="stooq")
+            record_freshness(cache_key, "stooq", TTL_PRICES)
+            return result
+        except Exception as exc:
+            _CB_STOOQ.record_failure()
+            last_exc = exc
+            logger.warning("Stooq prices failed for %s: %s", ticker, exc)
+
+    stale = get_stale_cache_obj(cache_key)
+    if stale is not None:
+        value, expires_at = stale
+        logger.warning("Serving stale prices for %s", ticker)
+        return PriceData.model_validate(value)
+
+    raise SourceUnavailable(
+        f"All price providers failed for {ticker}. Last error: {last_exc}"
+    )
+
+
+def get_fundamentals(ticker: str) -> Fundamentals:
+    cache_key = f"market:{ticker}:fundamentals"
+    cached = get_cache_obj(cache_key)
+    if cached:
+        return Fundamentals.model_validate(cached)
+
+    last_exc: Optional[Exception] = None
+
+    if not _CB_YFINANCE.is_open:
+        try:
+            result = _fetch_fundamentals_yfinance(ticker)
+            _CB_YFINANCE.record_success()
+            _PROVIDER_HEALTH[ticker] = {"status": "ok", "source": "yfinance"}
+            set_cache_obj(cache_key, result.model_dump(mode="json"), TTL_FUNDAMENTALS, source="yfinance")
+            record_freshness(cache_key, "yfinance", TTL_FUNDAMENTALS)
+            return result
+        except Exception as exc:
+            _CB_YFINANCE.record_failure()
+            last_exc = exc
+            logger.warning("yfinance fundamentals failed for %s: %s", ticker, exc)
+            _PROVIDER_HEALTH[ticker] = {
+                "status": "rate_limited", "source": "yfinance",
+                "detail": str(exc), "cb_state": _CB_YFINANCE.state(),
+            }
+
+    if _cfg.FMP_API_KEY and not _CB_FMP.is_open:
+        try:
+            result = _fetch_fundamentals_fmp(ticker)
+            _CB_FMP.record_success()
+            _PROVIDER_HEALTH[ticker] = {"status": "ok", "source": "fmp"}
+            set_cache_obj(cache_key, result.model_dump(mode="json"), TTL_FUNDAMENTALS, source="fmp")
+            record_freshness(cache_key, "fmp", TTL_FUNDAMENTALS)
+            return result
+        except Exception as exc:
+            _CB_FMP.record_failure()
+            last_exc = exc
+            logger.warning("FMP fundamentals failed for %s: %s", ticker, exc)
+
+    stale = get_stale_cache_obj(cache_key)
+    if stale is not None:
+        value, expires_at = stale
+        age_secs = int(time.time() - expires_at)
+        logger.warning("Serving stale fundamentals for %s (expired %ds ago)", ticker, age_secs)
+        _PROVIDER_HEALTH[ticker] = {
+            "status": "stale", "source": "cache",
+            "detail": f"all providers failed; serving data expired {age_secs}s ago",
+            "cb_state": _CB_YFINANCE.state(),
+        }
+        return Fundamentals.model_validate(value)
+
+    raise SourceUnavailable(
+        f"All market data providers failed for {ticker}. "
+        f"Last error: {last_exc}. Try again in a few minutes."
+    )
 
 
 @retry(max_attempts=3, base_delay=2.0)

@@ -94,7 +94,11 @@ def _build_portfolio(portfolio_id: int, name: str) -> Portfolio:
     pf = Portfolio(name=name, holdings=holdings)
     result: EnrichmentResult = enrich_with_prices(pf)
     if result.failed:
-        st.warning(f"Could not fetch prices for: {', '.join(result.failed)}. Their market values show as $0.")
+        lines = [f"- **{t}**: {result.fetch_errors.get(t, 'fetch failed')}" for t in result.failed]
+        st.warning(
+            f"Price data unavailable for {len(result.failed)} holding(s) — "
+            "value and weights below are partial:\n\n" + "\n".join(lines)
+        )
     return result.portfolio
 
 
@@ -180,11 +184,22 @@ def _render_portfolio_editor(portfolio_id: int, portfolio_name: str) -> Optional
 
 
 def _render_portfolio_analysis(portfolio: Portfolio) -> None:
+    has_failed = any(h.market_value is None and not h.is_cash for h in portfolio.holdings)
+
     col_title, col_value = st.columns([3, 1])
     with col_title:
         st.markdown(f"### {portfolio.name}")
     with col_value:
-        st.metric("Portfolio Value", f"${portfolio.total_value:,.0f}")
+        label = "Partial Value ⚠" if has_failed else "Portfolio Value"
+        st.metric(label, f"${portfolio.total_value:,.0f}")
+
+    if has_failed:
+        failed_tickers = [h.ticker for h in portfolio.holdings if h.market_value is None and not h.is_cash]
+        st.warning(
+            f"**{', '.join(failed_tickers)}** — price unavailable. "
+            "Portfolio value and weights reflect only the holdings with live prices. "
+            "Do not treat these weights as allocation targets."
+        )
 
     # Main holdings table
     df = portfolio.to_dataframe()
@@ -200,6 +215,9 @@ def _render_portfolio_analysis(portfolio: Portfolio) -> None:
             return df[col].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "—")
         return df[col]
 
+    has_cost_basis = any(h.cost_basis is not None for h in portfolio.holdings)
+    has_pnl = any(h.unrealized_pnl is not None for h in portfolio.holdings)
+
     display_df = df.copy()
     for col in ["Market Value", "Unrealized P&L", "Unrealized P&L %", "Weight", "Price", "Cost Basis"]:
         if col in display_df.columns:
@@ -211,6 +229,16 @@ def _render_portfolio_analysis(portfolio: Portfolio) -> None:
         "Market Value": "Position Value",
         "Weight": "Portfolio Weight",
     })
+
+    # Drop cost basis / P&L columns when no holding provides that data
+    if not has_cost_basis:
+        for col in ["Cost Basis", "Unrealized P&L", "Unrealized P&L %"]:
+            if col in display_df.columns:
+                display_df = display_df.drop(columns=[col])
+    elif not has_pnl:
+        for col in ["Unrealized P&L", "Unrealized P&L %"]:
+            if col in display_df.columns:
+                display_df = display_df.drop(columns=[col])
 
     st.dataframe(display_df, hide_index=True, use_container_width=True)
 

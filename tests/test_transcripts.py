@@ -12,7 +12,10 @@ import httpx
 import pytest
 
 from data.resilience import SourceUnavailable
-from data.transcripts import TranscriptRateLimited, _fetch_transcript, get_last_n_transcripts, get_transcript
+from data.transcripts import (
+    Transcript, TranscriptRateLimited, _fetch_transcript,
+    _tickers_to_try, get_last_n_transcripts, get_transcript,
+)
 
 
 def _make_response(status_code: int, body: object, headers: dict | None = None) -> httpx.Response:
@@ -215,3 +218,170 @@ class TestGetLastNTranscripts:
         with patch("data.transcripts.get_transcript", return_value=None):
             results = get_last_n_transcripts("AAPL", n=4)
         assert results == []
+
+
+# ── Ticker alias tests ─────────────────────────────────────────────────────────
+
+class TestTickerAliases:
+    """GOOG/GOOGL and BRK.B/BRK-B aliases are tried before declaring not_found."""
+
+    def test_goog_aliases_include_googl(self) -> None:
+        aliases = _tickers_to_try("GOOG")
+        assert "GOOGL" in aliases
+
+    def test_googl_aliases_include_goog(self) -> None:
+        aliases = _tickers_to_try("GOOGL")
+        assert "GOOG" in aliases
+
+    def test_brk_b_variants_all_present(self) -> None:
+        aliases = _tickers_to_try("BRK.B")
+        assert "BRK-B" in aliases
+
+    def test_plain_ticker_returns_itself(self) -> None:
+        aliases = _tickers_to_try("AAPL")
+        assert "AAPL" in aliases
+        assert aliases[0] == "AAPL"
+
+    def test_goog_transcript_found_via_googl_alias(self) -> None:
+        """When GOOG returns nothing but GOOGL has a transcript, it is returned as GOOG."""
+        from data.transcripts import _get_transcript_from_chain
+
+        googl_transcript = Transcript(
+            ticker="GOOGL", year=2025, quarter=1, date="2025-04-29",
+            prepared_remarks="Sundar Pichai: Revenue was $90B.", qa_section="",
+            participants=["Sundar Pichai"], source="fmp",
+        )
+
+        call_log: list = []
+
+        def fake_fetch(sym, year, quarter):
+            call_log.append(sym)
+            if sym == "GOOGL":
+                return googl_transcript
+            return None  # GOOG returns nothing
+
+        with patch("data.transcripts.get_cache_obj", return_value=None), \
+             patch("data.transcripts.set_cache_obj"), \
+             patch("data.transcripts.record_freshness"), \
+             patch("data.transcripts._PROVIDERS") as mock_providers:
+            mock_p = MagicMock()
+            mock_p.name = "fmp"
+            mock_p.available.return_value = True
+            mock_p.fetch.side_effect = fake_fetch
+            mock_providers.__iter__ = MagicMock(return_value=iter([mock_p]))
+
+            result = _get_transcript_from_chain("GOOG", 2025, 1)
+
+        assert result is not None
+        assert result.ticker == "GOOG"        # normalized back to input ticker
+        assert "GOOGL" in call_log            # alias was tried
+        assert result.prepared_remarks == googl_transcript.prepared_remarks
+
+    def test_googl_resolved_directly(self) -> None:
+        """GOOGL lookup succeeds on first symbol without needing alias fallback."""
+        from data.transcripts import _get_transcript_from_chain
+
+        googl_transcript = Transcript(
+            ticker="GOOGL", year=2025, quarter=2, date="2025-07-30",
+            prepared_remarks="Sundar: Cloud grew 30%.", qa_section="",
+            participants=[], source="fmp",
+        )
+
+        def fake_fetch(sym, year, quarter):
+            if sym == "GOOGL":
+                return googl_transcript
+            return None
+
+        with patch("data.transcripts.get_cache_obj", return_value=None), \
+             patch("data.transcripts.set_cache_obj"), \
+             patch("data.transcripts.record_freshness"), \
+             patch("data.transcripts._PROVIDERS") as mock_providers:
+            mock_p = MagicMock()
+            mock_p.name = "fmp"
+            mock_p.available.return_value = True
+            mock_p.fetch.side_effect = fake_fetch
+            mock_providers.__iter__ = MagicMock(return_value=iter([mock_p]))
+
+            result = _get_transcript_from_chain("GOOGL", 2025, 2)
+
+        assert result is not None
+        assert result.ticker == "GOOGL"
+
+
+class TestEmptyStateDifferentiation:
+    """Empty-state outcomes must distinguish no_key / transport failure / true zero."""
+
+    def test_all_no_key_outcome_status(self) -> None:
+        """When no providers have keys, all outcomes are no_key."""
+        from data.transcripts import _get_transcript_from_chain
+
+        with patch("data.transcripts.get_cache_obj", return_value=None), \
+             patch("data.transcripts.set_cache_obj"), \
+             patch("data.transcripts.record_freshness"), \
+             patch("data.transcripts._PROVIDERS") as mock_providers:
+            mock_p = MagicMock()
+            mock_p.name = "fmp"
+            mock_p.available.return_value = False
+            mock_providers.__iter__ = MagicMock(return_value=iter([mock_p]))
+
+            result = _get_transcript_from_chain("NVDA", 2025, 1)
+
+        assert result is None
+        from data.transcripts import get_transcript_provider_outcomes
+        outcomes = get_transcript_provider_outcomes("NVDA")
+        assert any(o["status"] == "no_key" for o in outcomes)
+
+    def test_transport_error_recorded_not_not_found(self) -> None:
+        """A provider that raises RuntimeError gets status 'error', not 'not_found'."""
+        from data.transcripts import _get_transcript_from_chain
+
+        def failing_fetch(sym, year, quarter):
+            raise ConnectionError("Connection refused")
+
+        with patch("data.transcripts.get_cache_obj", return_value=None), \
+             patch("data.transcripts.set_cache_obj"), \
+             patch("data.transcripts.record_freshness"), \
+             patch("data.transcripts._PROVIDERS") as mock_providers:
+            mock_p = MagicMock()
+            mock_p.name = "fmp"
+            mock_p.available.return_value = True
+            mock_p.fetch.side_effect = failing_fetch
+            mock_providers.__iter__ = MagicMock(return_value=iter([mock_p]))
+
+            _get_transcript_from_chain("NVDA2", 2025, 1)
+
+        from data.transcripts import get_transcript_provider_outcomes
+        outcomes = get_transcript_provider_outcomes("NVDA2")
+        fmp_outcome = next((o for o in outcomes if o["provider"] == "fmp"), None)
+        assert fmp_outcome is not None
+        assert fmp_outcome["status"] == "error"
+        assert fmp_outcome["status"] != "not_found"
+
+    def test_all_transcript_calls_have_timeout(self) -> None:
+        """FmpProvider and FinnhubProvider use httpx.Client(timeout=20)."""
+        from data.transcripts import FmpProvider, FinnhubProvider
+        from unittest.mock import patch
+        import httpx
+
+        captured_timeouts: list = []
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                captured_timeouts.append(kwargs.get("timeout"))
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def get(self, *a, **kw):
+                return MagicMock(status_code=200, text="[]", json=MagicMock(return_value=[]))
+
+        with patch("httpx.Client", FakeClient):
+            try:
+                FmpProvider().fetch("AAPL", 2024, 4)
+            except Exception:
+                pass
+            try:
+                FinnhubProvider().fetch("AAPL", 2024, 4)
+            except Exception:
+                pass
+
+        assert all(t == 20 for t in captured_timeouts if t is not None), \
+            f"Expected timeout=20, got: {captured_timeouts}"

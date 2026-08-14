@@ -564,6 +564,7 @@ def render_portfolio_analysis_page() -> None:
         enrichment: EnrichmentResult = enrich_with_prices(portfolio)
         portfolio = enrichment.portfolio
         failed = enrichment.failed
+        fetch_errors = enrichment.fetch_errors
 
     # Surface pricing failures and gate optimization
     equity_holdings_all = [h for h in portfolio.holdings if not h.is_cash and h.ticker in tickers]
@@ -571,10 +572,7 @@ def render_portfolio_analysis_page() -> None:
     priced_eq = [h for h in equity_holdings_all if h.ticker not in failed]
 
     if failed_eq:
-        from data.cache import delete_cache, get_cache_obj
-
-        # Distinguish tickers that have never successfully been cached from transient failures
-        never_cached = {t for t in failed_eq if get_cache_obj(f"market:{t}:fundamentals") is None}
+        from data.cache import delete_cache
 
         st.error(
             f"**Price fetch failed for {len(failed_eq)} ticker(s).** "
@@ -582,14 +580,12 @@ def render_portfolio_analysis_page() -> None:
         )
         for t in failed_eq:
             h_match = next((h for h in equity_holdings_all if h.ticker == t), None)
-            pct_str = f"{(h_match.weight or 0) * 100:.1f}% of portfolio" if h_match else "unknown weight"
+            pct_str = f"unknown weight" if h_match is None else "unknown weight"
             if not _VALID_TICKER_RE.match(t):
                 reason = "⚠ likely invalid — ticker symbols are 1–5 uppercase letters"
-            elif t in never_cached:
-                reason = "never successfully fetched — may be a new or unrecognized ticker"
             else:
-                reason = "previously fetched; transient failure — retry likely to succeed"
-            st.markdown(f"- **{t}** ({pct_str}): {reason}")
+                reason = fetch_errors.get(t, "fetch failed — no detail recorded")
+            st.markdown(f"- **{t}**: {reason}")
 
         col_retry, _ = st.columns([2, 3])
         with col_retry:

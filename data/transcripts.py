@@ -37,6 +37,37 @@ logger = logging.getLogger(__name__)
 
 _TRANSCRIPT_HEALTH: Dict[str, List[Dict]] = {}
 
+# Dual-class / renamed tickers whose transcripts are published under a different symbol.
+# Map canonical → list of aliases to try (primary first when fetching).
+_TICKER_ALIASES: Dict[str, List[str]] = {
+    "GOOG":  ["GOOGL", "GOOG"],   # Alphabet non-voting → try voting class first
+    "GOOGL": ["GOOGL", "GOOG"],
+    "BRK.B": ["BRK-B", "BRKB", "BRK.B"],
+    "BRK-B": ["BRK-B", "BRK.B", "BRKB"],
+    "BRKB":  ["BRK-B", "BRKB"],
+    "BRK.A": ["BRK-A", "BRKA", "BRK.A"],
+    "BRK-A": ["BRK-A", "BRK.A", "BRKA"],
+    "BRKA":  ["BRK-A", "BRKA"],
+    "META":  ["META"],             # Formerly FB — already correct
+}
+
+
+def _tickers_to_try(ticker: str) -> List[str]:
+    """Return [primary, *aliases] for a ticker, deduped and in priority order."""
+    t = ticker.upper()
+    known = _TICKER_ALIASES.get(t)
+    if known:
+        return list(dict.fromkeys(known))   # preserve order, remove dups
+    # Generic dot/dash/no-suffix normalization (e.g. BF.B → BF-B)
+    variants = [t]
+    if "." in t:
+        variants.append(t.replace(".", "-"))
+        variants.append(t.replace(".", ""))
+    elif "-" in t:
+        variants.append(t.replace("-", "."))
+        variants.append(t.replace("-", ""))
+    return list(dict.fromkeys(variants))
+
 
 def get_transcript_provider_outcomes(ticker: str) -> List[Dict]:
     """Per-provider outcomes from the most recent get_last_n_transcripts call for ticker."""
@@ -673,32 +704,68 @@ def get_available_provider_names() -> List[str]:
 
 
 def _get_transcript_from_chain(ticker: str, year: int, quarter: int) -> Optional[Transcript]:
+    symbols = _tickers_to_try(ticker)
     outcomes: List[Dict] = []
     result: Optional[Transcript] = None
+
     for provider in _PROVIDERS:
         if not provider.available():
             outcomes.append({"provider": provider.name, "status": "no_key"})
             continue
-        try:
-            t = provider.fetch(ticker, year, quarter)
-            if t is not None:
-                outcomes.append({"provider": provider.name, "status": "ok"})
-                result = t
-                break
-            else:
-                outcomes.append({"provider": provider.name, "status": "not_found"})
-        except (SourceUnavailable, TranscriptRateLimited):
+
+        found = False
+        for sym in symbols:
+            t0 = time.monotonic()
+            try:
+                t = provider.fetch(sym, year, quarter)
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                if t is not None:
+                    t.ticker = ticker.upper()  # normalize back to input ticker
+                    outcomes.append({
+                        "provider": provider.name,
+                        "status": "ok",
+                        "symbol_used": sym,
+                        "latency_ms": latency_ms,
+                        "chars": len(t.content),
+                    })
+                    result = t
+                    found = True
+                    break
+                # sym returned nothing — try next alias
+            except (SourceUnavailable, TranscriptRateLimited) as exc:
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                outcomes.append({
+                    "provider": provider.name,
+                    "status": "unavailable",
+                    "detail": str(exc),
+                    "symbol_used": sym,
+                    "latency_ms": latency_ms,
+                })
+                raise
+            except Exception as exc:
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                outcomes.append({
+                    "provider": provider.name,
+                    "status": "error",
+                    "detail": str(exc),
+                    "symbol_used": sym,
+                    "latency_ms": latency_ms,
+                })
+                logger.debug("Provider %s failed for %s %d Q%d: %s", provider.name, sym, year, quarter, exc)
+                break  # provider errored — don't try more aliases with same broken provider
+
+        if found:
+            break
+
+        # Record not_found only if no outcome already recorded for this provider
+        if not any(o["provider"] == provider.name for o in outcomes):
             outcomes.append({
                 "provider": provider.name,
-                "status": "unavailable",
-                "detail": "auth failed or plan required",
+                "status": "not_found",
+                "symbol_used": symbols[0] if symbols else ticker.upper(),
             })
-            raise
-        except Exception as exc:
-            outcomes.append({"provider": provider.name, "status": "error", "detail": str(exc)})
-            logger.debug("Provider %s failed for %s %d Q%d: %s", provider.name, ticker, year, quarter, exc)
 
-    # Merge into the per-ticker health dict (keep first outcome per provider across quarters)
+    # Merge into per-ticker health dict (keep best status per provider across quarters)
     existing = {o["provider"]: o for o in _TRANSCRIPT_HEALTH.get(ticker.upper(), [])}
     for o in outcomes:
         pname = o["provider"]
@@ -708,8 +775,11 @@ def _get_transcript_from_chain(ticker: str, year: int, quarter: int) -> Optional
 
     if result is not None:
         logger.info(
-            "Transcript %s %d Q%d served by %s (%d chars)",
-            ticker, year, quarter, result.source, len(result.content),
+            "Transcript %s %d Q%d served by %s via %s (%d chars, %dms)",
+            ticker, year, quarter, result.source,
+            next((o.get("symbol_used", ticker) for o in outcomes if o.get("status") == "ok"), ticker),
+            len(result.content),
+            next((o.get("latency_ms", 0) for o in outcomes if o.get("status") == "ok"), 0),
         )
     return result
 

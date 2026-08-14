@@ -91,3 +91,72 @@ class PartialResult(Exception):
 
 class SourceUnavailable(Exception):
     """Raised when a data source is entirely unreachable after retries."""
+
+
+import threading as _threading
+
+
+class CircuitBreaker:
+    """Opens after `failure_threshold` consecutive failures; cools for `cooldown_secs`."""
+
+    def __init__(self, name: str, failure_threshold: int = 5, cooldown_secs: float = 300.0) -> None:
+        self.name = name
+        self._failures = 0
+        self._opened_at: Optional[float] = None
+        self._threshold = failure_threshold
+        self._cooldown = cooldown_secs
+        self._lock = _threading.Lock()
+
+    @property
+    def is_open(self) -> bool:
+        with self._lock:
+            if self._opened_at is None:
+                return False
+            return time.time() - self._opened_at < self._cooldown
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._opened_at = None
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failures += 1
+            if self._failures >= self._threshold and self._opened_at is None:
+                self._opened_at = time.time()
+                logger.warning("CircuitBreaker [%s] opened after %d failures", self.name, self._failures)
+
+    def state(self) -> str:
+        with self._lock:
+            if self._opened_at is None:
+                return "closed"
+            if time.time() - self._opened_at >= self._cooldown:
+                return "half-open"
+            return "open"
+
+
+class TokenBucket:
+    """Leaky token bucket: allows `rate` requests per second up to `capacity` burst."""
+
+    def __init__(self, rate: float, capacity: float) -> None:
+        self._rate = rate
+        self._capacity = capacity
+        self._tokens = float(capacity)
+        self._last_refill = time.time()
+        self._lock = _threading.Lock()
+
+    def acquire(self, block: bool = True) -> bool:
+        with self._lock:
+            now = time.time()
+            self._tokens = min(self._capacity, self._tokens + (now - self._last_refill) * self._rate)
+            self._last_refill = now
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return True
+            if not block:
+                return False
+            wait = (1.0 - self._tokens) / self._rate
+        time.sleep(wait)
+        with self._lock:
+            self._tokens = max(0.0, self._tokens - 1.0)
+            return True
