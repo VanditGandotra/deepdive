@@ -34,8 +34,17 @@ signal="positive": result/commentary explicitly beat expectations or management 
 signal="neutral":  in-line with expectations, or directionally mixed with no clear net surprise
 signal="negative": missed expectations or management cut/withdrew guidance vs prior
 
-confidence: "high" if supported by explicit numbers, "medium" if directional language only, "low" if speculative
-evidence: brief direct quote or paraphrase (max 30 words)
+IMPORTANT signal rules:
+- Management tone (confident, cautious, evasive) is NOT a signal — tone belongs in Pass B.
+  Signals must be grounded in explicit data, metrics, or guidance language from the transcript.
+- neutral is the DEFAULT. Set signal="neutral" whenever evidence is mixed, ambiguous, or thin.
+  Do not manufacture positive or negative readings just to fill signal slots.
+- Missing data is not neutral: omit the signal entirely rather than guessing.
+
+confidence: "high" if supported by explicit numbers or direct guidance language,
+            "medium" if directional language only (e.g. "above expectations" without quantifying),
+            "low" if speculative or inferred — use sparingly
+evidence: brief direct quote or paraphrase from the transcript (max 30 words)
 rationale: one sentence explaining why positive/neutral/negative vs prior expectations
 """)
 

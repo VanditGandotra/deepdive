@@ -49,7 +49,8 @@ def cached_quality_panel(ticker: str):
 
 
 @st.cache_data(ttl=21_600, show_spinner=False)
-def cached_calls(ticker: str, n: int = 4):
+def cached_calls(ticker: str, n: int = 4, cache_version: int = 2):
+    # cache_version busts stale pickled CallSummary objects from before the signals field existed
     from analysis.calls import analyse_all_calls
     return analyse_all_calls(ticker, n=n)
 

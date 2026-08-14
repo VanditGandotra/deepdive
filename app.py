@@ -412,46 +412,60 @@ def tab_financials(ticker: str, settings: Dict) -> None:
         error_card("Ratio engine error", str(exc))
 
 
-_SIGNAL_DOT = {
-    "positive": ("🟢", "Positive"),
-    "neutral":  ("⚪", "Neutral"),
-    "negative": ("🔴", "Negative"),
+# Distinct shape + color per signal direction — shapes ensure accessibility when color is unavailable.
+# ▲ = bullish, ● = neutral, ▼ = bearish.
+_SIGNAL_SHAPE: dict[str, tuple[str, str, str]] = {
+    "positive": ("▲", "#2ecc71", "Positive"),
+    "neutral":  ("●", "#95a5a6", "Neutral"),
+    "negative": ("▼", "#e74c3c", "Negative"),
 }
-_SIGNAL_CONF_COLOR = {"high": "#2ecc71", "medium": "#f39c12", "low": "#95a5a6"}
+# Opacity per confidence level — low-confidence rows are visually de-emphasized.
+_SIGNAL_OPACITY = {"high": "1.0", "medium": "0.75", "low": "0.45"}
 
 
 def _render_signal_scorecard(summary) -> None:
-    """Render EarningsSignal list as an accessibility-safe scorecard (dot + label).
+    """Render EarningsSignal list as an accessibility-safe scorecard.
 
     Uses getattr so stale pickled CallSummary objects (from before the signals
     field existed) degrade gracefully instead of raising AttributeError.
+    Shapes (▲●▼) carry direction independently of color for accessibility.
+    Low-confidence signals are de-emphasized via opacity.
+    Evidence and rationale are revealed on click to reduce visual noise.
     """
     signals = getattr(summary, "signals", None)
     if not signals:
         # Distinguish genuinely missing (stale cache) from a live neutral reading.
         st.caption(
             "📋 Signal data not available for this cached analysis — "
-            "clear the in-memory cache and re-run to generate signals."
+            "clear the Streamlit in-memory cache and re-run to generate signals."
         )
         return
+
     overall = getattr(summary, "signal_overall", "neutral")
-    overall_dot, overall_label = _SIGNAL_DOT.get(overall, ("⚪", "Neutral"))
-    st.markdown(f"**Signal Scorecard** — overall: {overall_dot} {overall_label}")
+    ov_shape, ov_color, ov_label = _SIGNAL_SHAPE.get(overall, ("●", "#95a5a6", "Neutral"))
+    st.markdown(
+        f'**Signal Scorecard** — overall: '
+        f'<span style="color:{ov_color};font-size:1.1em">{ov_shape}</span> {ov_label}',
+        unsafe_allow_html=True,
+    )
+
     for sig in signals:
-        dot, label = _SIGNAL_DOT.get(sig.signal, ("⚪", "Neutral"))
-        conf_color = _SIGNAL_CONF_COLOR.get(sig.confidence, "#95a5a6")
-        with st.container():
-            cols = st.columns([1, 6])
-            with cols[0]:
-                st.markdown(f"{dot} **{label}**")
-            with cols[1]:
-                conf_badge = f'<span style="font-size:0.75rem;color:{conf_color}">[{sig.confidence}]</span>'
-                st.markdown(
-                    f"**{sig.topic}** {conf_badge}<br>"
-                    f"<span style='font-size:0.85rem'>{sig.rationale}</span><br>"
-                    f"<span style='font-size:0.8rem;color:#888'>{sig.evidence}</span>",
-                    unsafe_allow_html=True,
-                )
+        shape, color, label = _SIGNAL_SHAPE.get(sig.signal, ("●", "#95a5a6", "Neutral"))
+        opacity = _SIGNAL_OPACITY.get(sig.confidence, "0.75")
+        conf_hint = "" if sig.confidence == "high" else f" [{sig.confidence} confidence]"
+        expander_label = (
+            f"{shape} {sig.topic}{conf_hint}"
+        )
+        with st.expander(expander_label, expanded=False):
+            st.markdown(
+                f'<div style="opacity:{opacity}">'
+                f'<span style="color:{color};font-size:1.05em;font-weight:bold">{shape} {label}</span>'
+                f'<br><span style="font-size:0.87rem">{sig.rationale}</span>'
+                f'<br><span style="font-size:0.8rem;color:#888"><em>Evidence:</em> {sig.evidence}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
     st.divider()
 
 
