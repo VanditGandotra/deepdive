@@ -85,10 +85,14 @@ class TestAllProvidersDownColdCacheRaises:
                    side_effect=SourceUnavailable("429")), \
              patch("data.market._fetch_fundamentals_fmp",
                    side_effect=ValueError("FMP down")), \
+             patch("data.market._fetch_fundamentals_from_stooq",
+                   side_effect=ValueError("Stooq down")), \
              patch("data.market._CB_YFINANCE") as mock_yf_cb, \
-             patch("data.market._CB_FMP") as mock_fmp_cb:
+             patch("data.market._CB_FMP") as mock_fmp_cb, \
+             patch("data.market._CB_STOOQ") as mock_stooq_cb:
             mock_yf_cb.is_open = False
             mock_fmp_cb.is_open = False
+            mock_stooq_cb.is_open = False
             with patch("data.market._cfg") as mock_cfg:
                 mock_cfg.FMP_API_KEY = "testkey"
                 with pytest.raises(SourceUnavailable):
@@ -214,10 +218,14 @@ class TestStaleBadgeMetadata:
                    side_effect=SourceUnavailable("429")), \
              patch("data.market._fetch_fundamentals_fmp",
                    side_effect=ValueError("FMP down")), \
+             patch("data.market._fetch_fundamentals_from_stooq",
+                   side_effect=ValueError("Stooq down")), \
              patch("data.market._CB_YFINANCE") as mock_yf_cb, \
-             patch("data.market._CB_FMP") as mock_fmp_cb:
+             patch("data.market._CB_FMP") as mock_fmp_cb, \
+             patch("data.market._CB_STOOQ") as mock_stooq_cb:
             mock_yf_cb.is_open = False
             mock_fmp_cb.is_open = False
+            mock_stooq_cb.is_open = False
             with patch("data.market._cfg") as mock_cfg:
                 mock_cfg.FMP_API_KEY = "testkey"
                 result = mkt.get_fundamentals("MSFT")
@@ -229,8 +237,8 @@ class TestStaleBadgeMetadata:
 
 class TestCallCountVerification:
 
-    def test_two_provider_calls_on_cold_cache_all_fail(self):
-        """On cold cache with all providers down: exactly 1 yfinance call + 1 FMP call made."""
+    def test_all_three_provider_calls_on_cold_cache_all_fail(self):
+        """On cold cache with all providers down: exactly 1 call each to yf, fmp, stooq."""
         import data.market as mkt
 
         with patch("data.market.get_cache_obj", return_value=None), \
@@ -239,10 +247,14 @@ class TestCallCountVerification:
                    side_effect=SourceUnavailable("yf down")) as mock_yf, \
              patch("data.market._fetch_fundamentals_fmp",
                    side_effect=ValueError("fmp down")) as mock_fmp, \
+             patch("data.market._fetch_fundamentals_from_stooq",
+                   side_effect=ValueError("stooq down")) as mock_stooq, \
              patch("data.market._CB_YFINANCE") as mock_yf_cb, \
-             patch("data.market._CB_FMP") as mock_fmp_cb:
+             patch("data.market._CB_FMP") as mock_fmp_cb, \
+             patch("data.market._CB_STOOQ") as mock_stooq_cb:
             mock_yf_cb.is_open = False
             mock_fmp_cb.is_open = False
+            mock_stooq_cb.is_open = False
             with patch("data.market._cfg") as mock_cfg:
                 mock_cfg.FMP_API_KEY = "testkey"
                 with pytest.raises(SourceUnavailable):
@@ -250,6 +262,7 @@ class TestCallCountVerification:
 
         assert mock_yf.call_count == 1, f"Expected 1 yfinance call, got {mock_yf.call_count}"
         assert mock_fmp.call_count == 1, f"Expected 1 FMP call, got {mock_fmp.call_count}"
+        assert mock_stooq.call_count == 1, f"Expected 1 Stooq call, got {mock_stooq.call_count}"
 
     def test_zero_provider_calls_on_warm_cache(self):
         """Warm SQLite cache: zero provider calls regardless of circuit breaker state."""
@@ -265,3 +278,145 @@ class TestCallCountVerification:
         assert result.ticker == "NVDA"
         assert mock_yf.call_count == 0
         assert mock_fmp.call_count == 0
+
+
+class TestChainAdvancesToStooqOnYfAndFmpFailure:
+    """Bug 1 regression: chain must reach Stooq when yfinance+FMP both fail."""
+
+    def test_stooq_called_and_succeeds_when_yf_and_fmp_fail(self):
+        import data.market as mkt
+        from datetime import datetime
+        stooq_result = Fundamentals(ticker="NVDA", current_price=130.0, fetched_at=datetime.utcnow())
+
+        with patch("data.market.get_cache_obj", return_value=None), \
+             patch("data.market.get_stale_cache_obj", return_value=None), \
+             patch("data.market.set_cache_obj"), \
+             patch("data.market.record_freshness"), \
+             patch("data.market._fetch_fundamentals_yfinance",
+                   side_effect=SourceUnavailable("429")) as mock_yf, \
+             patch("data.market._fetch_fundamentals_fmp",
+                   side_effect=ValueError("FMP 402")) as mock_fmp, \
+             patch("data.market._fetch_fundamentals_from_stooq",
+                   return_value=stooq_result) as mock_stooq, \
+             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._CB_FMP") as mock_fmp_cb, \
+             patch("data.market._CB_STOOQ") as mock_stooq_cb:
+            mock_yf_cb.is_open = False
+            mock_fmp_cb.is_open = False
+            mock_stooq_cb.is_open = False
+            with patch("data.market._cfg") as mock_cfg:
+                mock_cfg.FMP_API_KEY = "testkey"
+                result = mkt.get_fundamentals("NVDA")
+
+        assert result is not None
+        assert result.current_price == pytest.approx(130.0)
+        mock_yf.assert_called_once()
+        mock_fmp.assert_called_once()
+        mock_stooq.assert_called_once()
+
+
+class TestProviderOutcomesAllRecorded:
+    """Bug 2 regression: every provider attempt must appear in per-provider outcomes."""
+
+    def test_all_three_outcomes_recorded_on_all_fail(self):
+        import data.market as mkt
+
+        with patch("data.market.get_cache_obj", return_value=None), \
+             patch("data.market.get_stale_cache_obj", return_value=None), \
+             patch("data.market._fetch_fundamentals_yfinance",
+                   side_effect=SourceUnavailable("429")), \
+             patch("data.market._fetch_fundamentals_fmp",
+                   side_effect=ValueError("FMP err")), \
+             patch("data.market._fetch_fundamentals_from_stooq",
+                   side_effect=ValueError("Stooq err")), \
+             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._CB_FMP") as mock_fmp_cb, \
+             patch("data.market._CB_STOOQ") as mock_stooq_cb:
+            mock_yf_cb.is_open = False
+            mock_fmp_cb.is_open = False
+            mock_stooq_cb.is_open = False
+            with patch("data.market._cfg") as mock_cfg:
+                mock_cfg.FMP_API_KEY = "testkey"
+                with pytest.raises(SourceUnavailable):
+                    mkt.get_fundamentals("TSLA")
+
+        outcomes = mkt.get_provider_outcomes("TSLA")
+        providers_seen = {o["provider"] for o in outcomes}
+        assert "yfinance" in providers_seen
+        assert "fmp" in providers_seen
+        assert "stooq" in providers_seen
+
+    def test_open_cb_shows_skipped_in_outcomes(self):
+        import data.market as mkt
+        from datetime import datetime
+        fmp_result = Fundamentals(ticker="AMD", current_price=150.0, fetched_at=datetime.utcnow())
+
+        with patch("data.market.get_cache_obj", return_value=None), \
+             patch("data.market.get_stale_cache_obj", return_value=None), \
+             patch("data.market.set_cache_obj"), \
+             patch("data.market.record_freshness"), \
+             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._CB_FMP") as mock_fmp_cb, \
+             patch("data.market._fetch_fundamentals_yfinance") as mock_yf_fetch, \
+             patch("data.market._fetch_fundamentals_fmp", return_value=fmp_result):
+            mock_yf_cb.is_open = True   # yfinance CB is tripped
+            mock_yf_cb.state = lambda: "open"
+            mock_fmp_cb.is_open = False
+            with patch("data.market._cfg") as mock_cfg:
+                mock_cfg.FMP_API_KEY = "testkey"
+                mkt.get_fundamentals("AMD")
+
+        mock_yf_fetch.assert_not_called()
+        outcomes = mkt.get_provider_outcomes("AMD")
+        yf_outcome = next((o for o in outcomes if o["provider"] == "yfinance"), None)
+        assert yf_outcome is not None
+        assert yf_outcome["status"] == "skipped"
+
+
+class TestErrorSummaryNeverNone:
+    """Bug 3 regression: error message must not be 'None' when providers were skipped."""
+
+    def test_error_message_contains_skip_reason_when_all_cbs_open(self):
+        import data.market as mkt
+
+        with patch("data.market.get_cache_obj", return_value=None), \
+             patch("data.market.get_stale_cache_obj", return_value=None), \
+             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._CB_FMP") as mock_fmp_cb, \
+             patch("data.market._CB_STOOQ") as mock_stooq_cb:
+            mock_yf_cb.is_open = True
+            mock_yf_cb.state = lambda: "open"
+            mock_fmp_cb.is_open = True
+            mock_fmp_cb.state = lambda: "open"
+            mock_stooq_cb.is_open = True
+            mock_stooq_cb.state = lambda: "open"
+            with patch("data.market._cfg") as mock_cfg:
+                mock_cfg.FMP_API_KEY = "testkey"
+                with pytest.raises(SourceUnavailable) as exc_info:
+                    mkt.get_fundamentals("GOOG")
+
+        msg = str(exc_info.value)
+        assert "None" not in msg or "skipped" in msg, \
+            f"Error message should not contain bare 'None': {msg}"
+        assert "circuit breakers open" in msg or "skipped" in msg
+
+
+class TestFmpHandlesErrorDictResponse:
+    """Bug 4 regression: FMP returning error dict must raise ValueError, not KeyError."""
+
+    def test_fmp_error_dict_raises_value_error(self):
+        import config as cfg
+        original_key = cfg.FMP_API_KEY
+        cfg.FMP_API_KEY = "bad_key"
+        try:
+            from data.providers.fmp import FmpMarketProvider
+            fake_resp = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+            fake_resp.status_code = 200
+            fake_resp.raise_for_status = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+            fake_resp.json.return_value = {"Error Message": "Invalid API KEY. Please retry or visit..."}
+
+            with patch("httpx.get", return_value=fake_resp):
+                with pytest.raises(ValueError, match="unexpected response"):
+                    FmpMarketProvider().get_fundamentals("AAPL")
+        finally:
+            cfg.FMP_API_KEY = original_key

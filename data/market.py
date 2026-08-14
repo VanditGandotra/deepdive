@@ -23,6 +23,8 @@ from analysis.schemas import (
 logger = logging.getLogger(__name__)
 
 _PROVIDER_HEALTH: Dict[str, Any] = {}
+# Per-ticker list of provider attempt outcomes for the most recent fetch
+_PROVIDER_OUTCOMES: Dict[str, list] = {}
 
 _CB_YFINANCE = CircuitBreaker("yfinance", failure_threshold=3, cooldown_secs=300.0)
 _CB_FMP      = CircuitBreaker("fmp",      failure_threshold=5, cooldown_secs=300.0)
@@ -68,6 +70,11 @@ def get_provider_health() -> Dict[str, Any]:
     return dict(_PROVIDER_HEALTH)
 
 
+def get_provider_outcomes(ticker: str) -> list:
+    """Return per-provider attempt outcomes for the most recent get_fundamentals call."""
+    return list(_PROVIDER_OUTCOMES.get(ticker.upper(), []))
+
+
 def _safe_float(val: Any) -> Optional[float]:
     try:
         f = float(val)
@@ -109,6 +116,16 @@ def _fetch_price_stooq(ticker: str) -> float:
 def _fetch_fundamentals_fmp(ticker: str) -> Fundamentals:
     from data.providers.fmp import FmpMarketProvider
     return FmpMarketProvider().get_fundamentals(ticker)
+
+
+def _fetch_fundamentals_from_stooq(ticker: str) -> Fundamentals:
+    """Price-only fallback: build a minimal Fundamentals from Stooq's last close."""
+    close = _fetch_price_stooq(ticker)
+    return Fundamentals(
+        ticker=ticker,
+        current_price=close,
+        fetched_at=datetime.utcnow(),
+    )
 
 
 def _fetch_fundamentals_yfinance(ticker: str) -> Fundamentals:
@@ -336,38 +353,76 @@ def get_fundamentals(ticker: str) -> Fundamentals:
     if cached:
         return Fundamentals.model_validate(cached)
 
-    last_exc: Optional[Exception] = None
+    outcomes: list = []
+    errors: list = []
 
-    if not _CB_YFINANCE.is_open:
+    # ── yfinance ──────────────────────────────────────────────────────────────
+    if _CB_YFINANCE.is_open:
+        outcomes.append({"provider": "yfinance", "status": "skipped", "detail": f"CB {_CB_YFINANCE.state()}"})
+    else:
         try:
             result = _fetch_fundamentals_yfinance(ticker)
             _CB_YFINANCE.record_success()
+            outcomes.append({"provider": "yfinance", "status": "ok", "detail": ""})
             _PROVIDER_HEALTH[ticker] = {"status": "ok", "source": "yfinance"}
+            _PROVIDER_OUTCOMES[ticker] = outcomes
             set_cache_obj(cache_key, result.model_dump(mode="json"), TTL_FUNDAMENTALS, source="yfinance")
             record_freshness(cache_key, "yfinance", TTL_FUNDAMENTALS)
             return result
         except Exception as exc:
             _CB_YFINANCE.record_failure()
-            last_exc = exc
+            detail = str(exc)
+            outcomes.append({"provider": "yfinance", "status": "failed", "detail": detail})
+            errors.append(f"yfinance: {detail}")
             logger.warning("yfinance fundamentals failed for %s: %s", ticker, exc)
             _PROVIDER_HEALTH[ticker] = {
                 "status": "rate_limited", "source": "yfinance",
-                "detail": str(exc), "cb_state": _CB_YFINANCE.state(),
+                "detail": detail, "cb_state": _CB_YFINANCE.state(),
             }
 
-    if _cfg.FMP_API_KEY and not _CB_FMP.is_open:
+    # ── FMP ───────────────────────────────────────────────────────────────────
+    if not _cfg.FMP_API_KEY:
+        outcomes.append({"provider": "fmp", "status": "skipped", "detail": "FMP_API_KEY not configured"})
+    elif _CB_FMP.is_open:
+        outcomes.append({"provider": "fmp", "status": "skipped", "detail": f"CB {_CB_FMP.state()}"})
+    else:
         try:
             result = _fetch_fundamentals_fmp(ticker)
             _CB_FMP.record_success()
+            outcomes.append({"provider": "fmp", "status": "ok", "detail": ""})
             _PROVIDER_HEALTH[ticker] = {"status": "ok", "source": "fmp"}
+            _PROVIDER_OUTCOMES[ticker] = outcomes
             set_cache_obj(cache_key, result.model_dump(mode="json"), TTL_FUNDAMENTALS, source="fmp")
             record_freshness(cache_key, "fmp", TTL_FUNDAMENTALS)
             return result
         except Exception as exc:
             _CB_FMP.record_failure()
-            last_exc = exc
+            detail = str(exc)
+            outcomes.append({"provider": "fmp", "status": "failed", "detail": detail})
+            errors.append(f"fmp: {detail}")
             logger.warning("FMP fundamentals failed for %s: %s", ticker, exc)
 
+    # ── Stooq (price-only fallback) ───────────────────────────────────────────
+    if _CB_STOOQ.is_open:
+        outcomes.append({"provider": "stooq", "status": "skipped", "detail": f"CB {_CB_STOOQ.state()}"})
+    else:
+        try:
+            result = _fetch_fundamentals_from_stooq(ticker)
+            _CB_STOOQ.record_success()
+            outcomes.append({"provider": "stooq", "status": "ok", "detail": "price only"})
+            _PROVIDER_HEALTH[ticker] = {"status": "ok", "source": "stooq (price only)"}
+            _PROVIDER_OUTCOMES[ticker] = outcomes
+            set_cache_obj(cache_key, result.model_dump(mode="json"), TTL_FUNDAMENTALS, source="stooq")
+            record_freshness(cache_key, "stooq", TTL_FUNDAMENTALS)
+            return result
+        except Exception as exc:
+            _CB_STOOQ.record_failure()
+            detail = str(exc)
+            outcomes.append({"provider": "stooq", "status": "failed", "detail": detail})
+            errors.append(f"stooq: {detail}")
+            logger.warning("Stooq fundamentals failed for %s: %s", ticker, exc)
+
+    # ── Stale cache ───────────────────────────────────────────────────────────
     stale = get_stale_cache_obj(cache_key)
     if stale is not None:
         value, expires_at = stale
@@ -376,13 +431,16 @@ def get_fundamentals(ticker: str) -> Fundamentals:
         _PROVIDER_HEALTH[ticker] = {
             "status": "stale", "source": "cache",
             "detail": f"all providers failed; serving data expired {age_secs}s ago",
-            "cb_state": _CB_YFINANCE.state(),
         }
+        outcomes.append({"provider": "cache", "status": "stale", "detail": f"expired {age_secs}s ago"})
+        _PROVIDER_OUTCOMES[ticker] = outcomes
         return Fundamentals.model_validate(value)
 
+    _PROVIDER_OUTCOMES[ticker] = outcomes
+    error_summary = "; ".join(errors) if errors else "all providers skipped (circuit breakers open)"
     raise SourceUnavailable(
         f"All market data providers failed for {ticker}. "
-        f"Last error: {last_exc}. Try again in a few minutes."
+        f"Errors: {error_summary}. Try again in a few minutes."
     )
 
 

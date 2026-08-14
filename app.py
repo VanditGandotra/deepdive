@@ -1216,11 +1216,10 @@ def run_ticker_mode(ticker: str, settings: Dict) -> None:
             tab_thesis_memo(ticker, settings)
 
     # ── Provider diagnostics (collapsed) ──────────────────────────────────────
-    from data.market import get_provider_health
+    from data.market import get_provider_health, get_provider_outcomes
     from data.transcripts import get_transcript_provider_outcomes
     import data.market as _mkt_mod
     import config as _diag_cfg
-    mkt_health = get_provider_health()
     tx_outcomes = get_transcript_provider_outcomes(ticker)
     with st.expander("📡 Provider diagnostics", expanded=False):
         # Build stamp — always visible so deploys are verifiable
@@ -1229,34 +1228,36 @@ def run_ticker_mode(ticker: str, settings: Dict) -> None:
         # Provider chain: configured status regardless of whether a fetch has run
         st.markdown("**Provider chain (market data)**")
         _CB_ICONS = {"closed": "🟢", "half-open": "🟡", "open": "🔴"}
+        _fmp_key_set = bool(_diag_cfg.FMP_API_KEY)
         _chain_rows = [
-            ("yfinance", "no key needed", True,            _mkt_mod._CB_YFINANCE),
-            ("fmp",      "FMP_API_KEY",   bool(_diag_cfg.FMP_API_KEY), _mkt_mod._CB_FMP),
-            ("stooq",    "no key needed", True,            _mkt_mod._CB_STOOQ),
+            # (display_name, key_type, cb_obj)
+            # key_type: "keyless" | "present" | "missing"
+            ("yfinance", "keyless", _mkt_mod._CB_YFINANCE),
+            ("fmp",      "present" if _fmp_key_set else "missing", _mkt_mod._CB_FMP),
+            ("stooq",    "keyless", _mkt_mod._CB_STOOQ),
         ]
-        for pname, key_desc, has_cred, cb_obj in _chain_rows:
-            cred_icon = "🔑" if has_cred else "🚫"
-            cred_label = "key set" if has_cred else f"missing ({key_desc})"
+        _KEY_LABELS = {
+            "keyless": "🔓 no key required",
+            "present": "🔑 key present",
+            "missing": "🚫 key missing (add FMP_API_KEY to Streamlit secrets)",
+        }
+        for pname, key_type, cb_obj in _chain_rows:
             state = cb_obj.state()
             cb_icon = _CB_ICONS.get(state, "❓")
-            st.caption(f"  {cred_icon} **{pname}** — {cred_label}  ·  CB {cb_icon} {state}")
+            st.caption(f"  {_KEY_LABELS[key_type]}  ·  **{pname}** CB {cb_icon} {state}")
 
-        # Per-ticker last-fetch outcome (only after a fetch has run this session)
-        if mkt_health:
-            st.markdown("**Last fetch outcome**")
-            for t, h in mkt_health.items():
-                status = h.get("status", "unknown")
-                source = h.get("source", "?")
-                detail = h.get("detail", "")
-                cb_state = h.get("cb_state", "")
-                icon = "✅" if status == "ok" else ("🕐" if status == "stale" else "⚠️")
-                cb_icon = _CB_ICONS.get(cb_state, "") if cb_state else ""
-                parts = [f"{icon} **{t}** via {source}: {status}"]
-                if cb_icon:
-                    parts.append(f"CB {cb_icon} {cb_state}")
+        # Per-provider outcomes from most recent fetch attempt for this ticker
+        fetch_outcomes = get_provider_outcomes(ticker)
+        if fetch_outcomes:
+            st.markdown("**Last fetch — per-provider outcomes**")
+            _STATUS_ICONS = {"ok": "✅", "failed": "❌", "skipped": "⏭", "stale": "🕐"}
+            for o in fetch_outcomes:
+                icon = _STATUS_ICONS.get(o.get("status", ""), "❓")
+                detail = o.get("detail", "")
+                label = f"{icon} **{o['provider']}**: {o['status']}"
                 if detail:
-                    parts.append(f"— {detail}")
-                st.caption("  ".join(parts))
+                    label += f" — {detail}"
+                st.caption(f"  {label}")
 
         if tx_outcomes:
                 st.markdown("**Transcript providers**")

@@ -32,7 +32,9 @@ class FmpMarketProvider:
         )
         profile_resp.raise_for_status()
         profile_data = profile_resp.json()
-        profile = profile_data[0] if profile_data else {}
+        if not isinstance(profile_data, list) or not profile_data:
+            raise ValueError(f"FMP profile: unexpected response for {ticker}: {str(profile_data)[:120]}")
+        profile = profile_data[0]
 
         # Fetch key metrics TTM
         metrics_url = config.FMP_KEY_METRICS_TTM_URL.format(symbol=ticker)
@@ -41,7 +43,7 @@ class FmpMarketProvider:
         )
         metrics_resp.raise_for_status()
         metrics_data = metrics_resp.json()
-        metrics = metrics_data[0] if metrics_data else {}
+        metrics = metrics_data[0] if isinstance(metrics_data, list) and metrics_data else {}
 
         return Fundamentals(
             ticker=ticker,
