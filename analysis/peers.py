@@ -89,6 +89,7 @@ def get_peer_comps(
     all_tickers = [ticker.upper()] + [p.upper() for p in peer_tickers if p.upper() != ticker.upper()]
 
     rows: List[PeerRow] = []
+    failed_tickers: List[str] = []
     with ThreadPoolExecutor(max_workers=6) as pool:
         futures = {pool.submit(_fetch_peer_fund, t): t for t in all_tickers}
         for fut in as_completed(futures):
@@ -96,12 +97,14 @@ def get_peer_comps(
             fund = fut.result()
             if fund:
                 rows.append(_fund_to_peer_row(fund, is_target=(t == ticker.upper())))
+            else:
+                failed_tickers.append(t)
 
     # Sort: target first, then by market cap descending
     rows.sort(key=lambda r: (not r.is_target, -(r.market_cap or 0)))
 
     synthesis = _synthesize_peers(ticker, rows) if rows else ""
-    result = PeerComps(target_ticker=ticker.upper(), peers=rows, synthesis=synthesis)
+    result = PeerComps(target_ticker=ticker.upper(), peers=rows, synthesis=synthesis, failed_tickers=failed_tickers)
     set_cache_obj(cache_key, result.model_dump(mode="json"), TTL_FUNDAMENTALS)
     return result
 

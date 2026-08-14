@@ -35,6 +35,14 @@ from data.resilience import SourceUnavailable, retry
 
 logger = logging.getLogger(__name__)
 
+_TRANSCRIPT_HEALTH: Dict[str, List[Dict]] = {}
+
+
+def get_transcript_provider_outcomes(ticker: str) -> List[Dict]:
+    """Per-provider outcomes from the most recent get_last_n_transcripts call for ticker."""
+    return list(_TRANSCRIPT_HEALTH.get(ticker.upper(), []))
+
+
 _MAX_ATTEMPTS = 8
 
 # Q&A boundary: Operator line that announces the session opening
@@ -665,22 +673,45 @@ def get_available_provider_names() -> List[str]:
 
 
 def _get_transcript_from_chain(ticker: str, year: int, quarter: int) -> Optional[Transcript]:
+    outcomes: List[Dict] = []
+    result: Optional[Transcript] = None
     for provider in _PROVIDERS:
         if not provider.available():
+            outcomes.append({"provider": provider.name, "status": "no_key"})
             continue
         try:
-            result = provider.fetch(ticker, year, quarter)
-            if result is not None:
-                logger.info(
-                    "Transcript %s %d Q%d served by %s (%d chars)",
-                    ticker, year, quarter, provider.name, len(result.content),
-                )
-                return result
+            t = provider.fetch(ticker, year, quarter)
+            if t is not None:
+                outcomes.append({"provider": provider.name, "status": "ok"})
+                result = t
+                break
+            else:
+                outcomes.append({"provider": provider.name, "status": "not_found"})
         except (SourceUnavailable, TranscriptRateLimited):
+            outcomes.append({
+                "provider": provider.name,
+                "status": "unavailable",
+                "detail": "auth failed or plan required",
+            })
             raise
         except Exception as exc:
+            outcomes.append({"provider": provider.name, "status": "error", "detail": str(exc)})
             logger.debug("Provider %s failed for %s %d Q%d: %s", provider.name, ticker, year, quarter, exc)
-    return None
+
+    # Merge into the per-ticker health dict (keep first outcome per provider across quarters)
+    existing = {o["provider"]: o for o in _TRANSCRIPT_HEALTH.get(ticker.upper(), [])}
+    for o in outcomes:
+        pname = o["provider"]
+        if pname not in existing or existing[pname].get("status") != "ok":
+            existing[pname] = o
+    _TRANSCRIPT_HEALTH[ticker.upper()] = list(existing.values())
+
+    if result is not None:
+        logger.info(
+            "Transcript %s %d Q%d served by %s (%d chars)",
+            ticker, year, quarter, result.source, len(result.content),
+        )
+    return result
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

@@ -525,7 +525,8 @@ class PeerRow(BaseModel):
 class PeerComps(BaseModel):
     target_ticker: str
     peers: List[PeerRow] = []
-    synthesis: str = ""  # Sonnet one-paragraph narrative
+    synthesis: str = ""
+    failed_tickers: List[str] = []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

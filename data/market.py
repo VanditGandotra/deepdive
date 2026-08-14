@@ -7,16 +7,59 @@ from typing import Any, Dict, List, Optional
 
 import yfinance as yf
 import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
 
 from config import TTL_FUNDAMENTALS, TTL_NEWS, TTL_PRICES
 from data.cache import (get_cache_obj, record_freshness, set_cache_obj)
-from data.resilience import retry
+from data.resilience import retry, SourceUnavailable
 from analysis.schemas import (
     AnalystTarget, Fundamentals, InsiderTransaction,
     InstitutionalHolder, NewsItem, PriceBar, PriceData, ShortInterest,
 )
 
 logger = logging.getLogger(__name__)
+
+_PROVIDER_HEALTH: Dict[str, Any] = {}
+
+
+def _yf_session() -> "requests.Session":
+    """requests.Session with desktop User-Agent and 20s read timeout for every call."""
+    session = requests.Session()
+    session.headers["User-Agent"] = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    )
+    adapter = HTTPAdapter()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    _orig_send = session.send
+    def _send_with_timeout(*args, **kwargs):
+        kwargs.setdefault("timeout", 20)
+        return _orig_send(*args, **kwargs)
+    session.send = _send_with_timeout  # type: ignore[method-assign]
+    return session
+
+
+def _check_info(info: Dict[str, Any], ticker: str) -> None:
+    """Raise SourceUnavailable when Yahoo Finance returns a sparse dict (IP rate-limited)."""
+    n = sum(1 for v in info.values() if v is not None)
+    if n < 5:
+        _PROVIDER_HEALTH[ticker] = {
+            "status": "rate_limited",
+            "source": "yfinance/yahoo",
+            "detail": f"returned only {n} non-null fields — IP is rate-limited",
+        }
+        raise SourceUnavailable(
+            f"Yahoo Finance returned only {n} fields for {ticker}. "
+            "Shared cloud IPs are often rate-limited — try refreshing in ~30 seconds."
+        )
+    _PROVIDER_HEALTH[ticker] = {"status": "ok", "source": "yfinance/yahoo", "fields": n}
+
+
+def get_provider_health() -> Dict[str, Any]:
+    """Return the last-recorded market-data provider status per ticker."""
+    return dict(_PROVIDER_HEALTH)
 
 
 def _safe_float(val: Any) -> Optional[float]:
@@ -41,7 +84,7 @@ def get_prices(ticker: str, period: str = "5y") -> PriceData:
     if cached:
         return PriceData.model_validate(cached)
 
-    yf_ticker = yf.Ticker(ticker)
+    yf_ticker = yf.Ticker(ticker, session=_yf_session())
     hist = yf_ticker.history(period=period, auto_adjust=True)
     if hist.empty:
         raise ValueError(f"No price data returned for {ticker}")
@@ -72,8 +115,9 @@ def get_fundamentals(ticker: str) -> Fundamentals:
     if cached:
         return Fundamentals.model_validate(cached)
 
-    yf_ticker = yf.Ticker(ticker)
+    yf_ticker = yf.Ticker(ticker, session=_yf_session())
     info: Dict[str, Any] = yf_ticker.info or {}
+    _check_info(info, ticker)
 
     # Fetch income statement + cashflow once; used for FCF, net_margin, interest_coverage
     fin: Optional[pd.DataFrame] = None
@@ -249,7 +293,7 @@ def get_estimates(ticker: str) -> Dict[str, Any]:
     if cached:
         return cached
 
-    yf_ticker = yf.Ticker(ticker)
+    yf_ticker = yf.Ticker(ticker, session=_yf_session())
     result: Dict[str, Any] = {}
 
     # EPS trend
@@ -314,7 +358,7 @@ def get_beat_miss_history(ticker: str) -> List[Dict[str, Any]]:
     if cached:
         return cached
 
-    yf_ticker = yf.Ticker(ticker)
+    yf_ticker = yf.Ticker(ticker, session=_yf_session())
     records: List[Dict[str, Any]] = []
 
     try:
@@ -347,7 +391,7 @@ def get_insiders(ticker: str) -> List[InsiderTransaction]:
     if cached:
         return [InsiderTransaction.model_validate(r) for r in cached]
 
-    yf_ticker = yf.Ticker(ticker)
+    yf_ticker = yf.Ticker(ticker, session=_yf_session())
     transactions: List[InsiderTransaction] = []
     try:
         df = yf_ticker.insider_transactions
@@ -386,7 +430,7 @@ def get_holders(ticker: str) -> List[InstitutionalHolder]:
     if cached:
         return [InstitutionalHolder.model_validate(r) for r in cached]
 
-    yf_ticker = yf.Ticker(ticker)
+    yf_ticker = yf.Ticker(ticker, session=_yf_session())
     holders: List[InstitutionalHolder] = []
     try:
         df = yf_ticker.institutional_holders
@@ -415,7 +459,7 @@ def get_short_interest(ticker: str) -> ShortInterest:
     if cached:
         return ShortInterest.model_validate(cached)
 
-    yf_ticker = yf.Ticker(ticker)
+    yf_ticker = yf.Ticker(ticker, session=_yf_session())
     info = yf_ticker.info or {}
     result = ShortInterest(
         date=None,
@@ -435,7 +479,7 @@ def get_news(ticker: str, days: int = 30) -> List[NewsItem]:
     if cached:
         return [NewsItem.model_validate(r) for r in cached]
 
-    yf_ticker = yf.Ticker(ticker)
+    yf_ticker = yf.Ticker(ticker, session=_yf_session())
     items: List[NewsItem] = []
     cutoff = datetime.utcnow() - timedelta(days=days)
 

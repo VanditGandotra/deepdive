@@ -498,16 +498,48 @@ def tab_earnings_calls(ticker: str, settings: Dict) -> None:
     sentiments = call_data["sentiments"]
 
     if not transcripts:
-        providers = call_data.get("providers_tried") or []
-        if providers:
-            tried_str = " · ".join(f"`{p}`" for p in providers)
+        from data.transcripts import get_transcript_provider_outcomes
+        outcomes = get_transcript_provider_outcomes(ticker)
+
+        # Classify: if at least one provider returned "not_found" across all quarters,
+        # the transcripts genuinely don't exist for the requested range.
+        # If every available provider errored/was blocked, that's a fetch failure.
+        had_not_found = any(o.get("status") == "not_found" for o in outcomes)
+        had_ok_provider = any(o.get("status") == "ok" for o in outcomes)
+        all_no_key = outcomes and all(o.get("status") == "no_key" for o in outcomes)
+
+        if all_no_key:
+            st.warning(
+                f"No transcript providers are configured for **{ticker}**. "
+                "Add a free **FMP_API_KEY** (financialmodelingprep.com) to your "
+                "**Streamlit Cloud → App settings → Secrets** box."
+            )
+        elif had_not_found and not had_ok_provider:
             st.info(
-                f"No transcripts found for **{ticker}** in the last 8 quarters. "
-                f"Providers tried: {tried_str}. "
-                f"Add `FMP_API_KEY` to .env (free at financialmodelingprep.com) for broader coverage."
+                f"No transcripts found for **{ticker}** in the last 8 quarters "
+                "across all configured providers."
             )
         else:
-            st.info(f"No transcript providers are configured for **{ticker}**. Add `FMP_API_KEY` to .env.")
+            st.warning(
+                f"Transcript fetch incomplete for **{ticker}** — providers returned errors "
+                "or were blocked (common from shared cloud IPs). "
+                "Add **FMP_API_KEY** to Streamlit Cloud Secrets for a keyed API fallback."
+            )
+
+        if outcomes:
+            _STATUS_ICON = {
+                "ok": "✅", "not_found": "🔍", "no_key": "🔑",
+                "unavailable": "🚫", "error": "⚠️",
+            }
+            with st.expander("Provider details", expanded=False):
+                for o in outcomes:
+                    icon = _STATUS_ICON.get(o["status"], "❓")
+                    detail = f" — {o['detail']}" if o.get("detail") else ""
+                    st.caption(f"{icon} **{o['provider']}**: {o['status']}{detail}")
+                st.caption(
+                    "🔑 = no API key · 🔍 = searched, no results · "
+                    "🚫 = auth/plan required · ⚠️ = network error · ✅ = success"
+                )
         return
 
     # Sentiment trend chart
@@ -997,6 +1029,13 @@ def tab_peer_comps(ticker: str, settings: Dict) -> None:
     if comps.synthesis:
         st.info(comps.synthesis)
 
+    if comps.failed_tickers:
+        st.warning(
+            f"Could not fetch data for: **{', '.join(comps.failed_tickers)}**. "
+            "Yahoo Finance may be rate-limiting this IP — these tickers will appear "
+            "in the table as unavailable. Refresh in ~30 seconds to retry."
+        )
+
     # Build DataFrame
     def _pct(v):
         return f"{v*100:.1f}%" if v is not None else "—"
@@ -1019,6 +1058,14 @@ def tab_peer_comps(ticker: str, settings: Dict) -> None:
             "Net Margin": _pct(r.net_margin),
             "Rev Growth": _pct(r.revenue_growth_yoy),
             "FCF Yield": _pct(r.fcf_yield),
+        })
+    for ft in comps.failed_tickers:
+        rows.append({
+            "": ft,
+            "Name": "unavailable",
+            "Mkt Cap": "⚠", "P/E TTM": "⚠", "Fwd P/E": "⚠",
+            "EV/EBITDA": "⚠", "P/S": "⚠", "Gross Margin": "⚠",
+            "Net Margin": "⚠", "Rev Growth": "⚠", "FCF Yield": "⚠",
         })
 
     df = pd.DataFrame(rows)
@@ -1126,6 +1173,33 @@ def run_ticker_mode(ticker: str, settings: Dict) -> None:
                 st.rerun()
         else:
             tab_thesis_memo(ticker, settings)
+
+    # ── Provider diagnostics (collapsed) ──────────────────────────────────────
+    from data.market import get_provider_health
+    from data.transcripts import get_transcript_provider_outcomes
+    mkt_health = get_provider_health()
+    tx_outcomes = get_transcript_provider_outcomes(ticker)
+    if mkt_health or tx_outcomes:
+        with st.expander("📡 Provider diagnostics", expanded=False):
+            if mkt_health:
+                st.markdown("**Market data (yfinance/Yahoo Finance)**")
+                for t, h in mkt_health.items():
+                    status = h.get("status", "unknown")
+                    icon = "✅" if status == "ok" else "⚠️"
+                    detail = h.get("detail", "")
+                    n = h.get("fields")
+                    info_str = f"{n} fields" if n else detail
+                    st.caption(f"{icon} **{t}**: {status} — {info_str}")
+            if tx_outcomes:
+                st.markdown("**Transcript providers**")
+                _STATUS_ICON = {
+                    "ok": "✅", "not_found": "🔍", "no_key": "🔑",
+                    "unavailable": "🚫", "error": "⚠️",
+                }
+                for o in tx_outcomes:
+                    icon = _STATUS_ICON.get(o["status"], "❓")
+                    detail = f" — {o['detail']}" if o.get("detail") else ""
+                    st.caption(f"{icon} **{o['provider']}**: {o['status']}{detail}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
