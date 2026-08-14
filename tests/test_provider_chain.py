@@ -1,13 +1,19 @@
 # tests/test_provider_chain.py
-"""Provider chain integration tests: 429 failover, stale cache, all-down hard fail, circuit breaker, call-count."""
+"""Provider chain integration tests: failover, stale cache, all-down hard fail, circuit breaker, call-count.
+
+Chain order (as of current implementation):
+  get_fundamentals: EDGAR → FMP → yfinance → Stooq (price-only)
+  get_prices:       Stooq full-history → yfinance
+"""
 from __future__ import annotations
 
 import time
 from unittest.mock import MagicMock, patch
 import pytest
 
-from analysis.schemas import Fundamentals
+from analysis.schemas import Fundamentals, PriceBar, PriceData
 from data.resilience import SourceUnavailable
+from datetime import date
 
 
 def _make_fundamentals(ticker="PLTR"):
@@ -18,10 +24,26 @@ def _make_fundamentals(ticker="PLTR"):
     )
 
 
-class TestYfinance429FallsToFmp:
+def _make_price_data(ticker="PLTR", close=45.0):
+    return PriceData(
+        ticker=ticker, currency="USD",
+        bars=[PriceBar(date=date.today(), open=close, high=close, low=close, close=close, volume=0)],
+    )
 
-    def test_yfinance_429_triggers_fmp_fallback(self):
-        """When yfinance raises SourceUnavailable, FMP is called and its result returned."""
+
+# ── Helper: standard patch set for fundamentals calls (all providers open/failing) ──────
+
+def _edgar_skip():
+    """Return patches that set EDGAR CB as open (skipped without error)."""
+    return patch("data.market._CB_EDGAR")
+
+
+# ── Fundamentals chain tests ──────────────────────────────────────────────────
+
+class TestEdgarPrimaryFallsToFmp:
+    """EDGAR is tried first; when it fails, FMP is the next provider."""
+
+    def test_edgar_fail_triggers_fmp_fallback(self):
         import data.market as mkt
         fmp_result = _make_fundamentals()
 
@@ -29,25 +51,45 @@ class TestYfinance429FallsToFmp:
              patch("data.market.get_stale_cache_obj", return_value=None), \
              patch("data.market.set_cache_obj"), \
              patch("data.market.record_freshness"), \
-             patch("data.market._fetch_fundamentals_yfinance",
-                   side_effect=SourceUnavailable("Yahoo 429")), \
-             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._CB_EDGAR") as mock_edgar_cb, \
              patch("data.market._CB_FMP") as mock_fmp_cb, \
+             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._fetch_fundamentals_edgar",
+                   side_effect=ValueError("EDGAR: CIK not found")), \
              patch("data.market._fetch_fundamentals_fmp", return_value=fmp_result) as mock_fmp, \
              patch("data.market._cfg") as mock_cfg:
-            mock_yf_cb.is_open = False
+            mock_edgar_cb.is_open = False
             mock_fmp_cb.is_open = False
+            mock_yf_cb.is_open = False
             mock_cfg.FMP_API_KEY = "testkey"
             result = mkt.get_fundamentals("PLTR")
 
         assert result.ticker == "PLTR"
         mock_fmp.assert_called_once_with("PLTR")
 
+    def test_edgar_success_never_calls_fmp_or_yfinance(self):
+        import data.market as mkt
+        edgar_result = _make_fundamentals()
+
+        with patch("data.market.get_cache_obj", return_value=None), \
+             patch("data.market.get_stale_cache_obj", return_value=None), \
+             patch("data.market.set_cache_obj"), \
+             patch("data.market.record_freshness"), \
+             patch("data.market._CB_EDGAR") as mock_edgar_cb, \
+             patch("data.market._fetch_fundamentals_edgar", return_value=edgar_result), \
+             patch("data.market._fetch_fundamentals_fmp") as mock_fmp, \
+             patch("data.market._fetch_fundamentals_yfinance") as mock_yf:
+            mock_edgar_cb.is_open = False
+            result = mkt.get_fundamentals("PLTR")
+
+        assert result.ticker == "PLTR"
+        mock_fmp.assert_not_called()
+        mock_yf.assert_not_called()
+
 
 class TestStaleCacheServedOnAllProviderFailure:
 
     def test_stale_data_returned_when_all_providers_fail(self):
-        """When all providers fail but stale cache exists, stale data is returned (no exception)."""
         import data.market as mkt
         stale_fund = _make_fundamentals()
         stale_serialized = stale_fund.model_dump(mode="json")
@@ -57,18 +99,21 @@ class TestStaleCacheServedOnAllProviderFailure:
              patch("data.market.get_stale_cache_obj", return_value=(stale_serialized, past_expiry)), \
              patch("data.market.set_cache_obj"), \
              patch("data.market.record_freshness"), \
+             patch("data.market._CB_EDGAR") as mock_edgar_cb, \
+             patch("data.market._CB_FMP") as mock_fmp_cb, \
+             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._fetch_fundamentals_edgar",
+                   side_effect=ValueError("EDGAR down")), \
              patch("data.market._fetch_fundamentals_yfinance",
                    side_effect=SourceUnavailable("429")), \
              patch("data.market._fetch_fundamentals_fmp",
                    side_effect=ValueError("FMP down")), \
-             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
-             patch("data.market._CB_FMP") as mock_fmp_cb:
-            mock_yf_cb.is_open = False
+             patch("data.market._cfg") as mock_cfg:
+            mock_edgar_cb.is_open = False
             mock_fmp_cb.is_open = False
-            # Patch config.FMP_API_KEY to ensure FMP branch is tried
-            with patch("data.market._cfg") as mock_cfg:
-                mock_cfg.FMP_API_KEY = "testkey"
-                result = mkt.get_fundamentals("PLTR")
+            mock_yf_cb.is_open = False
+            mock_cfg.FMP_API_KEY = "testkey"
+            result = mkt.get_fundamentals("PLTR")
 
         assert result is not None
         assert result.ticker == "PLTR"
@@ -81,17 +126,21 @@ class TestAllProvidersDownColdCacheRaises:
 
         with patch("data.market.get_cache_obj", return_value=None), \
              patch("data.market.get_stale_cache_obj", return_value=None), \
+             patch("data.market._CB_EDGAR") as mock_edgar_cb, \
+             patch("data.market._CB_FMP") as mock_fmp_cb, \
+             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._CB_STOOQ") as mock_stooq_cb, \
+             patch("data.market._fetch_fundamentals_edgar",
+                   side_effect=ValueError("EDGAR down")), \
              patch("data.market._fetch_fundamentals_yfinance",
                    side_effect=SourceUnavailable("429")), \
              patch("data.market._fetch_fundamentals_fmp",
                    side_effect=ValueError("FMP down")), \
              patch("data.market._fetch_fundamentals_from_stooq",
-                   side_effect=ValueError("Stooq down")), \
-             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
-             patch("data.market._CB_FMP") as mock_fmp_cb, \
-             patch("data.market._CB_STOOQ") as mock_stooq_cb:
-            mock_yf_cb.is_open = False
+                   side_effect=ValueError("Stooq down")):
+            mock_edgar_cb.is_open = False
             mock_fmp_cb.is_open = False
+            mock_yf_cb.is_open = False
             mock_stooq_cb.is_open = False
             with patch("data.market._cfg") as mock_cfg:
                 mock_cfg.FMP_API_KEY = "testkey"
@@ -101,8 +150,8 @@ class TestAllProvidersDownColdCacheRaises:
 
 class TestCircuitBreakerSkipsProvider:
 
-    def test_open_yfinance_cb_skips_to_fmp(self):
-        """When yfinance CB is open, yfinance fetch is never called."""
+    def test_open_edgar_cb_falls_through_to_fmp(self):
+        """When EDGAR CB is open, FMP is tried without calling edgar fetch."""
         import data.market as mkt
         fmp_result = _make_fundamentals()
 
@@ -110,15 +159,36 @@ class TestCircuitBreakerSkipsProvider:
              patch("data.market.get_stale_cache_obj", return_value=None), \
              patch("data.market.set_cache_obj"), \
              patch("data.market.record_freshness"), \
-             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._CB_EDGAR") as mock_edgar_cb, \
              patch("data.market._CB_FMP") as mock_fmp_cb, \
-             patch("data.market._fetch_fundamentals_yfinance") as mock_yf_fetch, \
+             patch("data.market._fetch_fundamentals_edgar") as mock_edgar_fetch, \
              patch("data.market._fetch_fundamentals_fmp", return_value=fmp_result):
-            mock_yf_cb.is_open = True
+            mock_edgar_cb.is_open = True
+            mock_edgar_cb.state = lambda: "open"
             mock_fmp_cb.is_open = False
             with patch("data.market._cfg") as mock_cfg:
                 mock_cfg.FMP_API_KEY = "testkey"
                 result = mkt.get_fundamentals("PLTR")
+
+        mock_edgar_fetch.assert_not_called()
+        assert result is not None
+
+    def test_open_yfinance_cb_does_not_call_yfinance_fetch(self):
+        """When yfinance CB is open, yfinance fetch is never called."""
+        import data.market as mkt
+        edgar_result = _make_fundamentals()
+
+        with patch("data.market.get_cache_obj", return_value=None), \
+             patch("data.market.get_stale_cache_obj", return_value=None), \
+             patch("data.market.set_cache_obj"), \
+             patch("data.market.record_freshness"), \
+             patch("data.market._CB_EDGAR") as mock_edgar_cb, \
+             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._fetch_fundamentals_edgar", return_value=edgar_result), \
+             patch("data.market._fetch_fundamentals_yfinance") as mock_yf_fetch:
+            mock_edgar_cb.is_open = False
+            mock_yf_cb.is_open = True
+            result = mkt.get_fundamentals("PLTR")
 
         mock_yf_fetch.assert_not_called()
         assert result is not None
@@ -133,37 +203,60 @@ class TestCallCountOnWarmCache:
         serialized = cached_fund.model_dump(mode="json")
 
         with patch("data.market.get_cache_obj", return_value=serialized), \
+             patch("data.market._fetch_fundamentals_edgar") as mock_edgar, \
              patch("data.market._fetch_fundamentals_yfinance") as mock_yf, \
              patch("data.market._fetch_fundamentals_fmp") as mock_fmp:
             result = mkt.get_fundamentals("PLTR")
 
+        mock_edgar.assert_not_called()
         mock_yf.assert_not_called()
         mock_fmp.assert_not_called()
         assert result.ticker == "PLTR"
 
 
-class TestPrices429FallsToStooq:
+class TestPricesChain:
 
-    def test_yfinance_prices_429_falls_to_stooq(self):
-        """When yfinance prices fail, Stooq provides the fallback close price."""
+    def test_stooq_provides_full_price_history_as_primary(self):
+        """Stooq is tried first for prices and returns full OHLCV history."""
         import data.market as mkt
+        stooq_result = _make_price_data("PLTR", 45.50)
 
         with patch("data.market.get_cache_obj", return_value=None), \
              patch("data.market.get_stale_cache_obj", return_value=None), \
              patch("data.market.set_cache_obj"), \
              patch("data.market.record_freshness"), \
-             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
              patch("data.market._CB_STOOQ") as mock_stooq_cb, \
-             patch("data.market._fetch_prices_yfinance",
-                   side_effect=SourceUnavailable("429")), \
-             patch("data.market._fetch_price_stooq", return_value=45.50) as mock_stooq:
-            mock_yf_cb.is_open = False
+             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._fetch_prices_stooq_full", return_value=stooq_result) as mock_stooq, \
+             patch("data.market._fetch_prices_yfinance") as mock_yf:
             mock_stooq_cb.is_open = False
+            mock_yf_cb.is_open = False
             result = mkt.get_prices("PLTR")
 
-        mock_stooq.assert_called_once_with("PLTR")
-        assert result is not None
+        mock_stooq.assert_called_once()
+        mock_yf.assert_not_called()
         assert result.bars[-1].close == pytest.approx(45.50)
+
+    def test_stooq_prices_fail_falls_to_yfinance(self):
+        """When Stooq prices fail, yfinance provides the fallback."""
+        import data.market as mkt
+        yf_result = _make_price_data("PLTR", 46.0)
+
+        with patch("data.market.get_cache_obj", return_value=None), \
+             patch("data.market.get_stale_cache_obj", return_value=None), \
+             patch("data.market.set_cache_obj"), \
+             patch("data.market.record_freshness"), \
+             patch("data.market._CB_STOOQ") as mock_stooq_cb, \
+             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._fetch_prices_stooq_full",
+                   side_effect=ValueError("Stooq 404")), \
+             patch("data.market._fetch_prices_yfinance", return_value=yf_result) as mock_yf:
+            mock_stooq_cb.is_open = False
+            mock_yf_cb.is_open = False
+            result = mkt.get_prices("PLTR")
+
+        mock_yf.assert_called_once()
+        assert result.bars[-1].close == pytest.approx(46.0)
 
 
 class TestCircuitBreakerOpensAfterThresholdFailures:
@@ -179,7 +272,7 @@ class TestCircuitBreakerOpensAfterThresholdFailures:
         assert cb.is_open
         assert cb.state() == "open"
 
-    def test_open_cb_makes_zero_calls_to_yfinance(self):
+    def test_open_cb_makes_zero_calls_to_that_provider(self):
         """With yfinance CB open, the yfinance fetch function is never invoked."""
         import data.market as mkt
         fmp_result = _make_fundamentals()
@@ -188,12 +281,16 @@ class TestCircuitBreakerOpensAfterThresholdFailures:
              patch("data.market.get_stale_cache_obj", return_value=None), \
              patch("data.market.set_cache_obj"), \
              patch("data.market.record_freshness"), \
-             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._CB_EDGAR") as mock_edgar_cb, \
              patch("data.market._CB_FMP") as mock_fmp_cb, \
+             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._fetch_fundamentals_edgar",
+                   side_effect=ValueError("EDGAR down")), \
              patch("data.market._fetch_fundamentals_yfinance") as mock_yf_fetch, \
              patch("data.market._fetch_fundamentals_fmp", return_value=fmp_result):
-            mock_yf_cb.is_open = True   # CB is open
+            mock_edgar_cb.is_open = False
             mock_fmp_cb.is_open = False
+            mock_yf_cb.is_open = True   # yfinance CB open
             with patch("data.market._cfg") as mock_cfg:
                 mock_cfg.FMP_API_KEY = "testkey"
                 mkt.get_fundamentals("AAPL")
@@ -204,7 +301,6 @@ class TestCircuitBreakerOpensAfterThresholdFailures:
 class TestStaleBadgeMetadata:
 
     def test_provider_health_set_to_stale_when_serving_expired_cache(self):
-        """When stale cache is served, _PROVIDER_HEALTH[ticker]['status'] == 'stale'."""
         import data.market as mkt
         stale_fund = _make_fundamentals("MSFT")
         stale_data = stale_fund.model_dump(mode="json")
@@ -214,17 +310,21 @@ class TestStaleBadgeMetadata:
              patch("data.market.get_stale_cache_obj", return_value=(stale_data, past_expiry)), \
              patch("data.market.set_cache_obj"), \
              patch("data.market.record_freshness"), \
+             patch("data.market._CB_EDGAR") as mock_edgar_cb, \
+             patch("data.market._CB_FMP") as mock_fmp_cb, \
+             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._CB_STOOQ") as mock_stooq_cb, \
+             patch("data.market._fetch_fundamentals_edgar",
+                   side_effect=ValueError("EDGAR down")), \
              patch("data.market._fetch_fundamentals_yfinance",
                    side_effect=SourceUnavailable("429")), \
              patch("data.market._fetch_fundamentals_fmp",
                    side_effect=ValueError("FMP down")), \
              patch("data.market._fetch_fundamentals_from_stooq",
-                   side_effect=ValueError("Stooq down")), \
-             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
-             patch("data.market._CB_FMP") as mock_fmp_cb, \
-             patch("data.market._CB_STOOQ") as mock_stooq_cb:
-            mock_yf_cb.is_open = False
+                   side_effect=ValueError("Stooq down")):
+            mock_edgar_cb.is_open = False
             mock_fmp_cb.is_open = False
+            mock_yf_cb.is_open = False
             mock_stooq_cb.is_open = False
             with patch("data.market._cfg") as mock_cfg:
                 mock_cfg.FMP_API_KEY = "testkey"
@@ -237,32 +337,37 @@ class TestStaleBadgeMetadata:
 
 class TestCallCountVerification:
 
-    def test_all_three_provider_calls_on_cold_cache_all_fail(self):
-        """On cold cache with all providers down: exactly 1 call each to yf, fmp, stooq."""
+    def test_all_four_providers_called_on_cold_cache_all_fail(self):
+        """On cold cache with all providers down: exactly 1 call each to edgar, fmp, yf, stooq."""
         import data.market as mkt
 
         with patch("data.market.get_cache_obj", return_value=None), \
              patch("data.market.get_stale_cache_obj", return_value=None), \
+             patch("data.market._CB_EDGAR") as mock_edgar_cb, \
+             patch("data.market._CB_FMP") as mock_fmp_cb, \
+             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._CB_STOOQ") as mock_stooq_cb, \
+             patch("data.market._fetch_fundamentals_edgar",
+                   side_effect=ValueError("edgar down")) as mock_edgar, \
              patch("data.market._fetch_fundamentals_yfinance",
                    side_effect=SourceUnavailable("yf down")) as mock_yf, \
              patch("data.market._fetch_fundamentals_fmp",
                    side_effect=ValueError("fmp down")) as mock_fmp, \
              patch("data.market._fetch_fundamentals_from_stooq",
-                   side_effect=ValueError("stooq down")) as mock_stooq, \
-             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
-             patch("data.market._CB_FMP") as mock_fmp_cb, \
-             patch("data.market._CB_STOOQ") as mock_stooq_cb:
-            mock_yf_cb.is_open = False
+                   side_effect=ValueError("stooq down")) as mock_stooq:
+            mock_edgar_cb.is_open = False
             mock_fmp_cb.is_open = False
+            mock_yf_cb.is_open = False
             mock_stooq_cb.is_open = False
             with patch("data.market._cfg") as mock_cfg:
                 mock_cfg.FMP_API_KEY = "testkey"
                 with pytest.raises(SourceUnavailable):
                     mkt.get_fundamentals("PLTR")
 
-        assert mock_yf.call_count == 1, f"Expected 1 yfinance call, got {mock_yf.call_count}"
-        assert mock_fmp.call_count == 1, f"Expected 1 FMP call, got {mock_fmp.call_count}"
-        assert mock_stooq.call_count == 1, f"Expected 1 Stooq call, got {mock_stooq.call_count}"
+        assert mock_edgar.call_count == 1
+        assert mock_fmp.call_count == 1
+        assert mock_yf.call_count == 1
+        assert mock_stooq.call_count == 1
 
     def test_zero_provider_calls_on_warm_cache(self):
         """Warm SQLite cache: zero provider calls regardless of circuit breaker state."""
@@ -271,19 +376,21 @@ class TestCallCountVerification:
         serialized = cached_fund.model_dump(mode="json")
 
         with patch("data.market.get_cache_obj", return_value=serialized), \
+             patch("data.market._fetch_fundamentals_edgar") as mock_edgar, \
              patch("data.market._fetch_fundamentals_yfinance") as mock_yf, \
              patch("data.market._fetch_fundamentals_fmp") as mock_fmp:
             result = mkt.get_fundamentals("NVDA")
 
         assert result.ticker == "NVDA"
+        assert mock_edgar.call_count == 0
         assert mock_yf.call_count == 0
         assert mock_fmp.call_count == 0
 
 
-class TestChainAdvancesToStooqOnYfAndFmpFailure:
-    """Bug 1 regression: chain must reach Stooq when yfinance+FMP both fail."""
+class TestChainAdvancesToStooqOnAllOtherFailure:
+    """Regression: chain must reach Stooq when edgar+fmp+yfinance all fail."""
 
-    def test_stooq_called_and_succeeds_when_yf_and_fmp_fail(self):
+    def test_stooq_called_and_succeeds_when_others_fail(self):
         import data.market as mkt
         from datetime import datetime
         stooq_result = Fundamentals(ticker="NVDA", current_price=130.0, fetched_at=datetime.utcnow())
@@ -292,17 +399,21 @@ class TestChainAdvancesToStooqOnYfAndFmpFailure:
              patch("data.market.get_stale_cache_obj", return_value=None), \
              patch("data.market.set_cache_obj"), \
              patch("data.market.record_freshness"), \
+             patch("data.market._CB_EDGAR") as mock_edgar_cb, \
+             patch("data.market._CB_FMP") as mock_fmp_cb, \
+             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._CB_STOOQ") as mock_stooq_cb, \
+             patch("data.market._fetch_fundamentals_edgar",
+                   side_effect=ValueError("EDGAR: CIK not found")) as mock_edgar, \
              patch("data.market._fetch_fundamentals_yfinance",
                    side_effect=SourceUnavailable("429")) as mock_yf, \
              patch("data.market._fetch_fundamentals_fmp",
-                   side_effect=ValueError("FMP 402")) as mock_fmp, \
+                   side_effect=ValueError("FMP 403")) as mock_fmp, \
              patch("data.market._fetch_fundamentals_from_stooq",
-                   return_value=stooq_result) as mock_stooq, \
-             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
-             patch("data.market._CB_FMP") as mock_fmp_cb, \
-             patch("data.market._CB_STOOQ") as mock_stooq_cb:
-            mock_yf_cb.is_open = False
+                   return_value=stooq_result) as mock_stooq:
+            mock_edgar_cb.is_open = False
             mock_fmp_cb.is_open = False
+            mock_yf_cb.is_open = False
             mock_stooq_cb.is_open = False
             with patch("data.market._cfg") as mock_cfg:
                 mock_cfg.FMP_API_KEY = "testkey"
@@ -310,30 +421,35 @@ class TestChainAdvancesToStooqOnYfAndFmpFailure:
 
         assert result is not None
         assert result.current_price == pytest.approx(130.0)
-        mock_yf.assert_called_once()
+        mock_edgar.assert_called_once()
         mock_fmp.assert_called_once()
+        mock_yf.assert_called_once()
         mock_stooq.assert_called_once()
 
 
 class TestProviderOutcomesAllRecorded:
-    """Bug 2 regression: every provider attempt must appear in per-provider outcomes."""
+    """Every provider attempt must appear in per-provider outcomes."""
 
-    def test_all_three_outcomes_recorded_on_all_fail(self):
+    def test_all_four_outcomes_recorded_on_all_fail(self):
         import data.market as mkt
 
         with patch("data.market.get_cache_obj", return_value=None), \
              patch("data.market.get_stale_cache_obj", return_value=None), \
+             patch("data.market._CB_EDGAR") as mock_edgar_cb, \
+             patch("data.market._CB_FMP") as mock_fmp_cb, \
+             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
+             patch("data.market._CB_STOOQ") as mock_stooq_cb, \
+             patch("data.market._fetch_fundamentals_edgar",
+                   side_effect=ValueError("EDGAR down")), \
              patch("data.market._fetch_fundamentals_yfinance",
                    side_effect=SourceUnavailable("429")), \
              patch("data.market._fetch_fundamentals_fmp",
                    side_effect=ValueError("FMP err")), \
              patch("data.market._fetch_fundamentals_from_stooq",
-                   side_effect=ValueError("Stooq err")), \
-             patch("data.market._CB_YFINANCE") as mock_yf_cb, \
-             patch("data.market._CB_FMP") as mock_fmp_cb, \
-             patch("data.market._CB_STOOQ") as mock_stooq_cb:
-            mock_yf_cb.is_open = False
+                   side_effect=ValueError("Stooq err")):
+            mock_edgar_cb.is_open = False
             mock_fmp_cb.is_open = False
+            mock_yf_cb.is_open = False
             mock_stooq_cb.is_open = False
             with patch("data.market._cfg") as mock_cfg:
                 mock_cfg.FMP_API_KEY = "testkey"
@@ -342,48 +458,50 @@ class TestProviderOutcomesAllRecorded:
 
         outcomes = mkt.get_provider_outcomes("TSLA")
         providers_seen = {o["provider"] for o in outcomes}
-        assert "yfinance" in providers_seen
+        assert "edgar" in providers_seen
         assert "fmp" in providers_seen
+        assert "yfinance" in providers_seen
         assert "stooq" in providers_seen
 
     def test_open_cb_shows_skipped_in_outcomes(self):
         import data.market as mkt
         from datetime import datetime
-        fmp_result = Fundamentals(ticker="AMD", current_price=150.0, fetched_at=datetime.utcnow())
+        edgar_result = Fundamentals(ticker="AMD", current_price=150.0, fetched_at=datetime.utcnow())
 
         with patch("data.market.get_cache_obj", return_value=None), \
              patch("data.market.get_stale_cache_obj", return_value=None), \
              patch("data.market.set_cache_obj"), \
              patch("data.market.record_freshness"), \
+             patch("data.market._CB_EDGAR") as mock_edgar_cb, \
              patch("data.market._CB_YFINANCE") as mock_yf_cb, \
-             patch("data.market._CB_FMP") as mock_fmp_cb, \
-             patch("data.market._fetch_fundamentals_yfinance") as mock_yf_fetch, \
-             patch("data.market._fetch_fundamentals_fmp", return_value=fmp_result):
-            mock_yf_cb.is_open = True   # yfinance CB is tripped
+             patch("data.market._fetch_fundamentals_edgar", return_value=edgar_result), \
+             patch("data.market._fetch_fundamentals_yfinance") as mock_yf_fetch:
+            mock_edgar_cb.is_open = False
+            mock_yf_cb.is_open = True    # yfinance CB is tripped
             mock_yf_cb.state = lambda: "open"
-            mock_fmp_cb.is_open = False
-            with patch("data.market._cfg") as mock_cfg:
-                mock_cfg.FMP_API_KEY = "testkey"
-                mkt.get_fundamentals("AMD")
+            mkt.get_fundamentals("AMD")
 
         mock_yf_fetch.assert_not_called()
         outcomes = mkt.get_provider_outcomes("AMD")
-        yf_outcome = next((o for o in outcomes if o["provider"] == "yfinance"), None)
-        assert yf_outcome is not None
-        assert yf_outcome["status"] == "skipped"
+        edgar_outcome = next((o for o in outcomes if o["provider"] == "edgar"), None)
+        assert edgar_outcome is not None
+        assert edgar_outcome["status"] == "ok"
 
 
 class TestErrorSummaryNeverNone:
-    """Bug 3 regression: error message must not be 'None' when providers were skipped."""
+    """Error message must not be 'None' when providers were skipped."""
 
     def test_error_message_contains_skip_reason_when_all_cbs_open(self):
         import data.market as mkt
 
         with patch("data.market.get_cache_obj", return_value=None), \
              patch("data.market.get_stale_cache_obj", return_value=None), \
+             patch("data.market._CB_EDGAR") as mock_edgar_cb, \
              patch("data.market._CB_YFINANCE") as mock_yf_cb, \
              patch("data.market._CB_FMP") as mock_fmp_cb, \
              patch("data.market._CB_STOOQ") as mock_stooq_cb:
+            mock_edgar_cb.is_open = True
+            mock_edgar_cb.state = lambda: "open"
             mock_yf_cb.is_open = True
             mock_yf_cb.state = lambda: "open"
             mock_fmp_cb.is_open = True
@@ -461,8 +579,110 @@ class TestRedactSecurity:
             with pytest.raises(ValueError) as exc_info:
                 FmpMarketProvider().get_fundamentals("NVDA")
         msg = str(exc_info.value)
-        # Must not contain the real key value
         if cfg.FMP_API_KEY:
             assert cfg.FMP_API_KEY not in msg
-        # Must not contain apikey= query param pattern
         assert "apikey=" not in msg
+
+
+class TestEdgarProvider:
+    """Unit tests for the EDGAR fundamentals provider."""
+
+    def test_edgar_raises_when_cik_not_found(self):
+        from data.providers.edgar import EdgarFundamentalsProvider
+        with patch("data.providers.edgar._get_cik_direct", return_value=None):
+            with pytest.raises(ValueError, match="CIK not found"):
+                EdgarFundamentalsProvider().get_fundamentals("FAKEXYZ")
+
+    def test_edgar_raises_on_submissions_http_error(self):
+        from data.providers.edgar import EdgarFundamentalsProvider
+        fake_resp = MagicMock()
+        fake_resp.status_code = 503
+        with patch("data.providers.edgar._get_cik_direct", return_value="0001234567"), \
+             patch("data.providers.edgar._rate_limit"), \
+             patch("httpx.get", return_value=fake_resp):
+            with pytest.raises(ValueError, match="HTTP 503"):
+                EdgarFundamentalsProvider().get_fundamentals("AAPL")
+
+    def test_edgar_raises_when_name_is_empty(self):
+        from data.providers.edgar import EdgarFundamentalsProvider
+        fake_resp = MagicMock()
+        fake_resp.status_code = 200
+        fake_resp.json.return_value = {"name": None, "sic": "3674", "sicDescription": "Semiconductors"}
+        with patch("data.providers.edgar._get_cik_direct", return_value="0001234567"), \
+             patch("data.providers.edgar._rate_limit"), \
+             patch("data.providers.edgar.get_xbrl_facts", return_value=None), \
+             patch("data.providers.edgar._stooq_price", return_value=None), \
+             patch("httpx.get", return_value=fake_resp):
+            with pytest.raises(ValueError, match="no company name"):
+                EdgarFundamentalsProvider().get_fundamentals("FAKE")
+
+    def test_edgar_builds_fundamentals_from_profile(self):
+        from data.providers.edgar import EdgarFundamentalsProvider
+        fake_resp = MagicMock()
+        fake_resp.status_code = 200
+        fake_resp.json.return_value = {
+            "name": "Palantir Technologies Inc.",
+            "sic": "7372",
+            "sicDescription": "Prepackaged Software",
+        }
+        with patch("data.providers.edgar._get_cik_direct", return_value="0001321732"), \
+             patch("data.providers.edgar._rate_limit"), \
+             patch("data.providers.edgar.get_xbrl_facts", return_value=None), \
+             patch("data.providers.edgar._stooq_price", return_value=42.0), \
+             patch("httpx.get", return_value=fake_resp):
+            result = EdgarFundamentalsProvider().get_fundamentals("PLTR")
+
+        assert result.ticker == "PLTR"
+        assert result.name == "Palantir Technologies Inc."
+        assert result.current_price == pytest.approx(42.0)
+
+    def test_sic_sector_mapping(self):
+        from data.providers.edgar import _sic_to_sector
+        assert _sic_to_sector("7372") == "Technology"   # Prepackaged software
+        assert _sic_to_sector("3674") == "Technology"   # Semiconductors
+        assert _sic_to_sector("6022") == "Financials"   # Banks
+        assert _sic_to_sector("8011") == "Healthcare"   # Health services
+        assert _sic_to_sector("4813") == "Communication Services"
+        assert _sic_to_sector("invalid") is None
+
+
+class TestStooqProvider:
+    """Unit tests for stooq price provider."""
+
+    def test_get_price_lowercases_ticker(self):
+        """Stooq requires lowercase ticker symbols."""
+        from data.providers.stooq import StooqProvider
+        csv_body = "Date,Open,High,Low,Close,Volume\n2026-01-10,140.0,142.0,139.0,141.0,1000000\n"
+        fake_resp = MagicMock()
+        fake_resp.status_code = 200
+        fake_resp.raise_for_status = MagicMock()
+        fake_resp.content = csv_body.encode()
+        with patch("httpx.get", return_value=fake_resp) as mock_get:
+            StooqProvider().get_price("NVDA")
+        url_called = mock_get.call_args[0][0]
+        assert "nvda" in url_called
+        assert "NVDA" not in url_called
+
+    def test_get_price_raises_on_no_data_response(self):
+        from data.providers.stooq import StooqProvider
+        fake_resp = MagicMock()
+        fake_resp.raise_for_status = MagicMock()
+        fake_resp.content = b"No data"
+        with patch("httpx.get", return_value=fake_resp):
+            with pytest.raises(ValueError, match="no data"):
+                StooqProvider().get_price("FAKE")
+
+    def test_get_prices_returns_price_data_object(self):
+        from data.providers.stooq import StooqProvider
+        csv_body = (
+            "Date,Open,High,Low,Close,Volume\n"
+            "2026-01-09,139.0,141.0,138.0,140.0,900000\n"
+            "2026-01-10,140.0,142.0,139.0,141.0,1000000\n"
+        )
+        fake_resp = MagicMock()
+        fake_resp.raise_for_status = MagicMock()
+        fake_resp.content = csv_body.encode()
+        with patch("httpx.get", return_value=fake_resp):
+            result = StooqProvider().get_prices("NVDA", period="5y")
+        assert len(result.bars) == 2
+        assert result.bars[-1].close == pytest.approx(141.0)

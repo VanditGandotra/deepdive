@@ -26,8 +26,9 @@ _PROVIDER_HEALTH: Dict[str, Any] = {}
 # Per-ticker list of provider attempt outcomes for the most recent fetch
 _PROVIDER_OUTCOMES: Dict[str, list] = {}
 
-_CB_YFINANCE = CircuitBreaker("yfinance", failure_threshold=3, cooldown_secs=300.0)
+_CB_EDGAR    = CircuitBreaker("edgar",    failure_threshold=3, cooldown_secs=300.0)
 _CB_FMP      = CircuitBreaker("fmp",      failure_threshold=5, cooldown_secs=300.0)
+_CB_YFINANCE = CircuitBreaker("yfinance", failure_threshold=3, cooldown_secs=300.0)
 _CB_STOOQ    = CircuitBreaker("stooq",    failure_threshold=5, cooldown_secs=120.0)
 
 
@@ -111,6 +112,16 @@ def _fetch_prices_yfinance(ticker: str, period: str = "5y") -> PriceData:
 def _fetch_price_stooq(ticker: str) -> float:
     from data.providers.stooq import StooqProvider
     return StooqProvider().get_price(ticker)
+
+
+def _fetch_prices_stooq_full(ticker: str, period: str = "5y") -> PriceData:
+    from data.providers.stooq import StooqProvider
+    return StooqProvider().get_prices(ticker, period)
+
+
+def _fetch_fundamentals_edgar(ticker: str) -> Fundamentals:
+    from data.providers.edgar import EdgarFundamentalsProvider
+    return EdgarFundamentalsProvider().get_fundamentals(ticker)
 
 
 def _fetch_fundamentals_fmp(ticker: str) -> Fundamentals:
@@ -306,6 +317,20 @@ def get_prices(ticker: str, period: str = "5y") -> PriceData:
 
     last_exc: Optional[Exception] = None
 
+    # Stooq first — keyless, reliable, returns full daily OHLCV history
+    if not _CB_STOOQ.is_open:
+        try:
+            result = _fetch_prices_stooq_full(ticker, period)
+            _CB_STOOQ.record_success()
+            set_cache_obj(cache_key, result.model_dump(mode="json"), TTL_PRICES, source="stooq")
+            record_freshness(cache_key, "stooq", TTL_PRICES)
+            return result
+        except Exception as exc:
+            _CB_STOOQ.record_failure()
+            last_exc = exc
+            logger.warning("Stooq prices failed for %s: %s", ticker, exc)
+
+    # yfinance fallback — full history but rate-limits on shared cloud IPs
     if not _CB_YFINANCE.is_open:
         try:
             result = _fetch_prices_yfinance(ticker, period)
@@ -317,24 +342,6 @@ def get_prices(ticker: str, period: str = "5y") -> PriceData:
             _CB_YFINANCE.record_failure()
             last_exc = exc
             logger.warning("yfinance prices failed for %s: %s", ticker, exc)
-
-    if not _CB_STOOQ.is_open:
-        try:
-            close = _fetch_price_stooq(ticker)
-            from datetime import date
-            result = PriceData(
-                ticker=ticker, currency="USD",
-                bars=[PriceBar(date=date.today(), open=close, high=close, low=close,
-                               close=close, volume=0)],
-            )
-            _CB_STOOQ.record_success()
-            set_cache_obj(cache_key, result.model_dump(mode="json"), TTL_PRICES, source="stooq")
-            record_freshness(cache_key, "stooq", TTL_PRICES)
-            return result
-        except Exception as exc:
-            _CB_STOOQ.record_failure()
-            last_exc = exc
-            logger.warning("Stooq prices failed for %s: %s", ticker, exc)
 
     stale = get_stale_cache_obj(cache_key)
     if stale is not None:
@@ -356,29 +363,25 @@ def get_fundamentals(ticker: str) -> Fundamentals:
     outcomes: list = []
     errors: list = []
 
-    # ── yfinance ──────────────────────────────────────────────────────────────
-    if _CB_YFINANCE.is_open:
-        outcomes.append({"provider": "yfinance", "status": "skipped", "detail": f"CB {_CB_YFINANCE.state()}"})
+    # ── EDGAR (keyless, SEC data — most reliable on shared cloud IPs) ─────────
+    if _CB_EDGAR.is_open:
+        outcomes.append({"provider": "edgar", "status": "skipped", "detail": f"CB {_CB_EDGAR.state()}"})
     else:
         try:
-            result = _fetch_fundamentals_yfinance(ticker)
-            _CB_YFINANCE.record_success()
-            outcomes.append({"provider": "yfinance", "status": "ok", "detail": ""})
-            _PROVIDER_HEALTH[ticker] = {"status": "ok", "source": "yfinance"}
+            result = _fetch_fundamentals_edgar(ticker)
+            _CB_EDGAR.record_success()
+            outcomes.append({"provider": "edgar", "status": "ok", "detail": ""})
+            _PROVIDER_HEALTH[ticker] = {"status": "ok", "source": "edgar"}
             _PROVIDER_OUTCOMES[ticker] = outcomes
-            set_cache_obj(cache_key, result.model_dump(mode="json"), TTL_FUNDAMENTALS, source="yfinance")
-            record_freshness(cache_key, "yfinance", TTL_FUNDAMENTALS)
+            set_cache_obj(cache_key, result.model_dump(mode="json"), TTL_FUNDAMENTALS, source="edgar")
+            record_freshness(cache_key, "edgar", TTL_FUNDAMENTALS)
             return result
         except Exception as exc:
-            _CB_YFINANCE.record_failure()
+            _CB_EDGAR.record_failure()
             detail = redact(str(exc))
-            outcomes.append({"provider": "yfinance", "status": "failed", "detail": detail})
-            errors.append(f"yfinance: {detail}")
-            logger.warning("yfinance fundamentals failed for %s: %s", ticker, exc)
-            _PROVIDER_HEALTH[ticker] = {
-                "status": "rate_limited", "source": "yfinance",
-                "detail": detail, "cb_state": _CB_YFINANCE.state(),
-            }
+            outcomes.append({"provider": "edgar", "status": "failed", "detail": detail})
+            errors.append(f"edgar: {detail}")
+            logger.warning("EDGAR fundamentals failed for %s: %s", ticker, exc)
 
     # ── FMP ───────────────────────────────────────────────────────────────────
     if not _cfg.FMP_API_KEY:
@@ -402,7 +405,31 @@ def get_fundamentals(ticker: str) -> Fundamentals:
             errors.append(f"fmp: {detail}")
             logger.warning("FMP fundamentals failed for %s: %s", ticker, exc)
 
-    # ── Stooq (price-only fallback) ───────────────────────────────────────────
+    # ── yfinance (rate-limits on shared cloud IPs — try after keyless sources) ─
+    if _CB_YFINANCE.is_open:
+        outcomes.append({"provider": "yfinance", "status": "skipped", "detail": f"CB {_CB_YFINANCE.state()}"})
+    else:
+        try:
+            result = _fetch_fundamentals_yfinance(ticker)
+            _CB_YFINANCE.record_success()
+            outcomes.append({"provider": "yfinance", "status": "ok", "detail": ""})
+            _PROVIDER_HEALTH[ticker] = {"status": "ok", "source": "yfinance"}
+            _PROVIDER_OUTCOMES[ticker] = outcomes
+            set_cache_obj(cache_key, result.model_dump(mode="json"), TTL_FUNDAMENTALS, source="yfinance")
+            record_freshness(cache_key, "yfinance", TTL_FUNDAMENTALS)
+            return result
+        except Exception as exc:
+            _CB_YFINANCE.record_failure()
+            detail = redact(str(exc))
+            outcomes.append({"provider": "yfinance", "status": "failed", "detail": detail})
+            errors.append(f"yfinance: {detail}")
+            logger.warning("yfinance fundamentals failed for %s: %s", ticker, exc)
+            _PROVIDER_HEALTH[ticker] = {
+                "status": "rate_limited", "source": "yfinance",
+                "detail": detail, "cb_state": _CB_YFINANCE.state(),
+            }
+
+    # ── Stooq (price-only last resort) ────────────────────────────────────────
     if _CB_STOOQ.is_open:
         outcomes.append({"provider": "stooq", "status": "skipped", "detail": f"CB {_CB_STOOQ.state()}"})
     else:

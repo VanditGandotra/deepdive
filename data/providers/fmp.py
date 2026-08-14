@@ -51,16 +51,20 @@ class FmpMarketProvider:
             )
         profile = profile_data[0]
 
-        # Fetch key metrics TTM
+        # Fetch key metrics TTM (optional — may be restricted on free tier)
+        metrics: dict = {}
         metrics_url = config.FMP_KEY_METRICS_TTM_URL.format(symbol=ticker)
-        metrics_resp = httpx.get(
-            metrics_url, params={"apikey": config.FMP_API_KEY}, timeout=15
-        )
-        _check_fmp_response(metrics_resp, ticker, "key-metrics-ttm")
-        metrics_data = metrics_resp.json()
-        if isinstance(metrics_data, dict) and "Error Message" in metrics_data:
-            raise ValueError(f"FMP key-metrics error for {ticker}: {metrics_data['Error Message']}")
-        metrics = metrics_data[0] if isinstance(metrics_data, list) and metrics_data else {}
+        try:
+            metrics_resp = httpx.get(
+                metrics_url, params={"apikey": config.FMP_API_KEY}, timeout=15
+            )
+            if metrics_resp.status_code == 200:
+                metrics_data = metrics_resp.json()
+                if isinstance(metrics_data, list) and metrics_data:
+                    metrics = metrics_data[0]
+            # 403 = endpoint restricted to higher tier; silently skip extra ratios
+        except Exception:
+            pass
 
         return Fundamentals(
             ticker=ticker,
