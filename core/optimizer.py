@@ -421,6 +421,7 @@ def optimize_portfolio(
 def _build_optimizer_payload(result: OptimizeResult, method: str) -> str:
     """Serialize optimizer result into a compact payload for LLM prose summary."""
     import json
+    from core.serialization import to_jsonable
 
     n = len(result.tickers)
     corr = result.corr_matrix
@@ -494,7 +495,118 @@ def _build_optimizer_payload(result: OptimizeResult, method: str) -> str:
             for r in result.sensitivity
         ],
     }
-    return json.dumps(payload, indent=2)
+    return json.dumps(to_jsonable(payload), indent=2, allow_nan=False)
+
+
+def _build_fallback_summary(result: OptimizeResult, method: str) -> str:
+    """Template-based optimizer explanation used when the LLM call fails.
+
+    Every number comes from result — no estimates or invented figures.
+    Produces the same section structure as the LLM prompt so the UI layout
+    is consistent regardless of which path rendered the explanation.
+    """
+    method_labels = {
+        "max_sharpe": "Maximum Sharpe",
+        "min_vol": "Minimum Volatility",
+        "risk_parity": "Risk Parity",
+    }
+    method_label = method_labels.get(method, method)
+    n = len(result.tickers)
+    long_run = 9.0
+
+    # Arithmetic: weight × expected_return per holding
+    arithmetic_lines = []
+    for i, t in enumerate(result.tickers):
+        w = result.proposed_weights[i]
+        mu = result.mu[i]
+        contribution = w * mu * 100
+        arithmetic_lines.append(
+            f"  {t}: {w*100:.1f}% × {mu*100:.1f}% = {contribution:.2f}pp"
+        )
+    arithmetic_lines.append(
+        f"  **Portfolio E[r] = {result.expected_return*100:.1f}%**"
+        f"  |  Vol = {result.expected_vol*100:.1f}%"
+        f"  |  Sharpe = ({result.expected_return*100:.1f}% − {result.risk_free_rate*100:.1f}%)"
+        f" / {result.expected_vol*100:.1f}% = **{result.sharpe:.2f}**"
+    )
+
+    # Why each weight moved
+    move_lines = []
+    for i, t in enumerate(result.tickers):
+        cur = result.current_weights[i] * 100
+        prop = result.proposed_weights[i] * 100
+        delta = prop - cur
+        sign = "+" if delta >= 0 else ""
+        at_cap = result.binding_constraints and any(t in bc for bc in result.binding_constraints)
+        note = " — **at position cap** (constraint-driven, not optimizer preference)" if at_cap else ""
+        if prop < 0.1:
+            note = " — **zeroed out** (optimizer found it added variance without improving risk-adjusted return)"
+        move_lines.append(
+            f"  **{t}**: {cur:.1f}% → {prop:.1f}% ({sign}{delta:.1f}pp){note}"
+        )
+
+    # Binding constraints
+    if result.binding_constraints:
+        constraint_text = (
+            "**Binding constraints:** " + "; ".join(result.binding_constraints) + ". "
+            "Weights hitting their cap are corner solutions — the optimizer wanted "
+            "more of these names but was stopped by the cap. The reported weights "
+            "reflect the constraint, not optimizer conviction."
+        )
+    else:
+        constraint_text = (
+            "No constraints binding — all weights are interior solutions. "
+            "These are the optimizer's genuine preferences, not forced by any cap."
+        )
+
+    # Plausibility
+    plausibility = f"Portfolio E[r] = {result.expected_return*100:.1f}% vs long-run baseline ~{long_run}%."
+    if result.expected_return * 100 > 2 * long_run:
+        # Find the ticker driving it
+        max_mu_idx = max(range(n), key=lambda i: result.mu[i])
+        max_t = result.tickers[max_mu_idx]
+        plausibility += (
+            f" Significantly above baseline — driven by {max_t}'s historical return of "
+            f"{result.mu[max_mu_idx]*100:.1f}%. Historical means over {result.lookback_days}d "
+            "are noisy; treat this figure as an estimate, not a forecast."
+        )
+    else:
+        plausibility += " Within a plausible range relative to the long-run equity baseline."
+
+    lines = [
+        f"## Inputs",
+        f"- Lookback: {result.lookback_days} trading days of daily returns",
+        f"- Risk-free rate: {result.risk_free_rate*100:.1f}%",
+        f"- Expected returns: historical mean daily return × 252 (annualized) — noisy estimate",
+        f"- Covariance: Ledoit-Wolf shrinkage ({n}×{n} matrix)",
+        f"",
+        f"## Active Constraints",
+        f"- Position cap: {result.max_position_weight*100:.0f}% per holding",
+        f"- Sector cap: {result.max_sector_weight*100:.0f}% per sector",
+        f"- Turnover penalty: {result.turnover_penalty:.2f}",
+        f"- {constraint_text}",
+        f"",
+        f"## The Arithmetic",
+        *arithmetic_lines,
+        f"",
+        f"## Why Each Weight Moved",
+        *move_lines,
+        f"",
+        f"## Dominant Assumption",
+        f"Historical mean returns are the sole expected-return input for {method_label}. "
+        f"With {n} assets and {result.lookback_days}d of data, these means carry high estimation "
+        "error — a ±2pp shock to any holding's expected return often moves weights significantly. "
+        "This is why sensitivity rows show large Δweight for unconstrained names.",
+        f"",
+        f"## Plausibility Check",
+        plausibility,
+        f"",
+        f"## What Would Change the Recommendation",
+        f"A different lookback period, an alternative expected-return estimator (e.g., Black-Litterman "
+        f"with analyst price targets), a tighter or looser position cap (currently "
+        f"{result.max_position_weight*100:.0f}%), or adding a turnover penalty to reduce churn.",
+    ]
+    return "\n".join(lines)
 
 
 def generate_optimizer_summary(result: OptimizeResult, method: str) -> str:

@@ -67,8 +67,11 @@ def test_scenario_card_no_price_target_skips_metric():
 def test_scenario_card_shows_probability():
     scenario = Scenario(scenario="bull", probability=0.35, narrative="")
     mock_st = _call_scenario_card(scenario)
-    caption_calls = " ".join(str(c) for c in mock_st.caption.call_args_list)
-    assert "35%" in caption_calls
+    # Probability is now in the header markdown, not a separate caption
+    rendered_text = " ".join(
+        str(c) for c in mock_st.markdown.call_args_list + mock_st.caption.call_args_list
+    )
+    assert "35%" in rendered_text
 
 
 def test_ticker_drillthrough_module_deleted():
@@ -113,3 +116,119 @@ def test_ticker_analysis_expected_return_1y_derived():
     analysis = _make_analysis()
     assert analysis.expected_return_1y is not None
     assert -1.0 < analysis.expected_return_1y < 5.0
+
+
+# ── Issue 5 regression tests: scenario cards and portfolio aggregation ────────
+
+def test_scenario_card_shows_all_three_cases():
+    """Every holding must produce a card for bull, base, and bear."""
+    analysis = _make_analysis("AAPL")
+    assert len(analysis.scenarios) == 3
+    labels = {s.scenario for s in analysis.scenarios}
+    assert labels == {"bull", "base", "bear"}
+
+
+def test_scenario_card_shows_narrative():
+    """Narrative text must be rendered — not just the price target."""
+    scenario = Scenario(
+        scenario="bull", probability=0.35, price_target=200.0,
+        narrative="AI spending drives upside."
+    )
+    mock_st = _call_scenario_card(scenario, current_price=150.0)
+    rendered_text = " ".join(str(c) for c in mock_st.markdown.call_args_list)
+    assert "AI spending" in rendered_text
+
+
+def test_scenario_card_shows_drivers():
+    """Drivers must appear in the rendered output."""
+    scenario = Scenario(
+        scenario="bear", probability=0.20, price_target=80.0,
+        narrative="",
+        drivers=[
+            Driver(name="Margin compression", direction="negative"),
+            Driver(name="FX headwind", direction="negative"),
+        ],
+    )
+    mock_st = _call_scenario_card(scenario, current_price=150.0)
+    rendered_text = " ".join(str(c) for c in mock_st.markdown.call_args_list)
+    assert "Margin compression" in rendered_text
+
+
+def test_scenario_aggregation_produces_three_rows():
+    """Portfolio aggregation must produce exactly 3 rows (bull, base, bear)."""
+    from unittest.mock import patch, MagicMock
+
+    tickers = ["AAPL", "MSFT"]
+    current_weights = {"AAPL": 0.6, "MSFT": 0.4}
+    proposed_weights = {"AAPL": 0.5, "MSFT": 0.5}
+
+    analysis_aapl = _make_analysis("AAPL")
+    analysis_msft = _make_analysis("MSFT")
+
+    session = {
+        "_scenario_AAPL": analysis_aapl,
+        "_scenario_MSFT": analysis_msft,
+    }
+
+    captured_dfs = []
+    mock_st = MagicMock()
+    mock_st.session_state = session
+
+    def fake_dataframe(df, **kwargs):
+        captured_dfs.append(df)
+
+    mock_st.dataframe.side_effect = fake_dataframe
+
+    with patch("ui.portfolio_analysis_ui.st", mock_st):
+        from ui.portfolio_analysis_ui import _render_scenario_aggregation
+        _render_scenario_aggregation(tickers, current_weights, proposed_weights)
+
+    assert len(captured_dfs) == 1
+    df = captured_dfs[0]
+    assert len(df) == 3  # bull, base, bear
+    assert set(df["Scenario"]) == {"Bull", "Base", "Bear"}
+
+
+def test_scenario_aggregation_computes_weighted_return():
+    """Weighted portfolio return = Σ weight × implied_return for each scenario."""
+    from unittest.mock import patch, MagicMock
+    from core.schemas import TickerAnalysis, Scenario
+    from datetime import date
+
+    # Build analyses with known implied returns
+    def make_a(ticker, bull_target, base_target, bear_target, price=100.0):
+        return TickerAnalysis(
+            ticker=ticker, as_of=date.today(), current_price=price,
+            scenarios=[
+                Scenario(scenario="bull", price_target=bull_target, probability=0.35),
+                Scenario(scenario="base", price_target=base_target, probability=0.45),
+                Scenario(scenario="bear", price_target=bear_target, probability=0.20),
+            ],
+        )
+
+    # AAPL: bull=+20%, base=+10%, bear=-10% (at price 100)
+    # MSFT: bull=+30%, base=+5%,  bear=-20%
+    analysis_aapl = make_a("AAPL", 120, 110, 90)
+    analysis_msft = make_a("MSFT", 130, 105, 80)
+
+    tickers = ["AAPL", "MSFT"]
+    cur_w = {"AAPL": 0.5, "MSFT": 0.5}
+    prop_w = {"AAPL": 0.6, "MSFT": 0.4}
+
+    session = {"_scenario_AAPL": analysis_aapl, "_scenario_MSFT": analysis_msft}
+
+    captured_dfs = []
+    mock_st = MagicMock()
+    mock_st.session_state = session
+    mock_st.dataframe.side_effect = lambda df, **kw: captured_dfs.append(df)
+
+    with patch("ui.portfolio_analysis_ui.st", mock_st):
+        from ui.portfolio_analysis_ui import _render_scenario_aggregation
+        _render_scenario_aggregation(tickers, cur_w, prop_w)
+
+    df = captured_dfs[0]
+    bull_row = df[df["Scenario"] == "Bull"].iloc[0]
+
+    # Expected bull return (current weights): 0.5*0.20 + 0.5*0.30 = 0.25
+    cur_bull_str = bull_row["Weighted Return (current weights)"]
+    assert "+25.0%" in cur_bull_str or "+25%" in cur_bull_str, f"Got: {cur_bull_str}"

@@ -34,6 +34,305 @@ def _back_button(key: str = "portfolio_analysis__back") -> None:
         st.rerun()
 
 
+import logging as _logging
+
+_log = _logging.getLogger(__name__)
+
+
+def _one_way_turnover(current: list[float], proposed: list[float]) -> float:
+    """Fraction of the portfolio that trades hands (one-way)."""
+    return sum(abs(p - c) for p, c in zip(proposed, current)) / 2.0
+
+
+def _render_constraints_panel(
+    result,
+    method: str,
+    holdings_hash: str,
+    max_pos: float,
+    max_sec: float,
+    turnover_penalty: float,
+) -> None:
+    """Rewritten constraints panel: interpretation over raw numbers."""
+    from core.optimizer import optimize_portfolio
+
+    n = len(result.tickers)
+
+    # ── Binding constraints ────────────────────────────────────────────────────
+    if result.binding_constraints:
+        bc_names = ", ".join(
+            bc.split(" at ")[0] for bc in result.binding_constraints
+        )
+        st.warning(
+            f"**Corner solution — {bc_names} are pinned at their cap.** "
+            f"The optimizer wanted *more* of these names and was stopped by the "
+            f"{result.max_position_weight*100:.0f}% position cap. "
+            "The reported weights are constraint-driven, not optimizer conviction. "
+            "Relax the cap to see the unconstrained optima."
+        )
+    else:
+        st.success(
+            "No constraints binding — all weights are interior solutions "
+            "(the optimizer's genuine preference given the input data)."
+        )
+
+    # ── Sector utilization ─────────────────────────────────────────────────────
+    if result.sector_map:
+        from collections import defaultdict
+        sec_to_w: dict[str, float] = defaultdict(float)
+        for t, w in zip(result.tickers, result.proposed_weights):
+            sec_to_w[result.sector_map.get(t, "Unknown")] += w
+        max_sec_name = max(sec_to_w, key=sec_to_w.__getitem__)
+        max_sec_w = sec_to_w[max_sec_name]
+        sec_util_pct = max_sec_w / result.max_sector_weight * 100
+        if sec_util_pct >= 90:
+            st.warning(
+                f"**{max_sec_name} sector: {max_sec_w*100:.1f}% / {result.max_sector_weight*100:.0f}% cap "
+                f"({sec_util_pct:.0f}% utilized — near binding).**"
+            )
+        else:
+            st.info(
+                f"Max sector exposure: {max_sec_name} at {max_sec_w*100:.1f}% "
+                f"(cap is {result.max_sector_weight*100:.0f}% — {sec_util_pct:.0f}% utilized, inactive)."
+            )
+
+    # ── Turnover consequence ───────────────────────────────────────────────────
+    ot = _one_way_turnover(result.current_weights, result.proposed_weights)
+    if result.turnover_penalty == 0.0:
+        if ot > 0.05:
+            st.warning(
+                f"**Turnover penalty = 0 — optimizer ignored trading costs.** "
+                f"Proposed portfolio requires {ot*100:.1f}% one-way turnover "
+                f"({sum(max(0.0, p-c) for p, c in zip(result.proposed_weights, result.current_weights))*100:.1f}% in buys). "
+                "At 0.10–0.30% round-trip cost, this erases meaningful alpha."
+            )
+        else:
+            st.caption(
+                f"One-way turnover: {ot*100:.1f}% — low enough that trading costs are immaterial."
+            )
+    else:
+        st.caption(
+            f"Turnover penalty: {result.turnover_penalty:.2f} · "
+            f"One-way turnover: {ot*100:.1f}%"
+        )
+
+    # ── Shadow cost of the position cap ───────────────────────────────────────
+    shadow_key = f"_opt_shadow_{method}_{holdings_hash}"
+    if result.binding_constraints:
+        if shadow_key not in st.session_state:
+            if st.button(
+                "Calculate shadow cost of position cap →",
+                key=f"portfolio_analysis__shadow__{method}",
+                help="Re-solves with the position cap raised by 10pp to show what the constraint costs.",
+            ):
+                relaxed_cap = min(max_pos + 0.10, 1.0)
+                with st.spinner(f"Re-solving with {relaxed_cap*100:.0f}% cap…"):
+                    try:
+                        shadow_result = optimize_portfolio(
+                            tickers=result.tickers,
+                            current_weights=result.current_weights,
+                            method=method,
+                            max_position_weight=relaxed_cap,
+                            max_sector_weight=max_sec,
+                            turnover_penalty=turnover_penalty,
+                            sector_map=result.sector_map,
+                        )
+                        st.session_state[shadow_key] = {
+                            "relaxed_cap": relaxed_cap,
+                            "delta_sharpe": shadow_result.sharpe - result.sharpe,
+                            "delta_vol": shadow_result.expected_vol - result.expected_vol,
+                            "delta_ret": shadow_result.expected_return - result.expected_return,
+                        }
+                    except Exception as exc:
+                        st.session_state[shadow_key] = {"error": str(exc)}
+                st.rerun()
+        else:
+            sc = st.session_state[shadow_key]
+            if "error" in sc:
+                st.caption(f"Shadow cost computation failed: {sc['error']}")
+            else:
+                ds = sc["delta_sharpe"]
+                dv = sc["delta_vol"] * 100
+                dr = sc["delta_ret"] * 100
+                cap_pct = sc["relaxed_cap"] * 100
+                sign_s = "+" if ds >= 0 else ""
+                sign_v = "+" if dv >= 0 else ""
+                st.info(
+                    f"**Shadow cost:** raising the cap from {max_pos*100:.0f}% → {cap_pct:.0f}% "
+                    f"would change Sharpe {sign_s}{ds:.3f} "
+                    f"and Vol {sign_v}{dv:.1f}pp. "
+                    + (f"The cap is costing you {-ds:.3f} Sharpe units." if ds < 0 else
+                       "The cap is not the binding constraint on Sharpe.")
+                )
+
+    # ── Inputs disclosure ─────────────────────────────────────────────────────
+    st.caption(
+        f"Expected returns: historical mean daily return × 252 (noisy — dominates Max Sharpe weighting). "
+        f"Lookback: {result.lookback_days}d · Covariance: Ledoit-Wolf shrinkage · "
+        f"rf = {result.risk_free_rate*100:.1f}% · "
+        f"n = {n} assets (small matrix — treat weights as direction, not exact allocation)."
+    )
+
+
+def _render_insights_panel(
+    result,
+    portfolio_value: float,
+    priced_holdings,
+) -> None:
+    """Trade list, metrics comparison, risk contributions, correlation."""
+    import math
+
+    n = len(result.tickers)
+
+    # ── Trade list ────────────────────────────────────────────────────────────
+    st.subheader("Trade List")
+    st.caption("Buys and sells needed to move from current to proposed weights.")
+    hold_by_ticker = {h.ticker: h for h in (priced_holdings or [])}
+    buys, sells = [], []
+    total_ot = 0.0
+    for i, t in enumerate(result.tickers):
+        cur_w = result.current_weights[i]
+        prop_w = result.proposed_weights[i]
+        delta_w = prop_w - cur_w
+        delta_pct = delta_w * 100
+        dollar_delta = delta_w * portfolio_value
+        h = hold_by_ticker.get(t)
+        if h and h.current_price and h.current_price > 0:
+            shares_delta = abs(dollar_delta) / h.current_price
+            shares_str = f"{shares_delta:,.0f} sh"
+        else:
+            shares_str = "—"
+        row = {
+            "Ticker": t,
+            "Current": f"{cur_w*100:.1f}%",
+            "Proposed": f"{prop_w*100:.1f}%",
+            "Δ Weight": f"{delta_pct:+.1f}pp",
+            "Δ $ (est.)": f"${dollar_delta:+,.0f}" if portfolio_value > 0 else "—",
+            "Shares (est.)": shares_str if delta_w != 0 else "0",
+        }
+        if delta_w > 0.001:
+            buys.append(row)
+        elif delta_w < -0.001:
+            sells.append(row)
+        total_ot += abs(delta_w)
+    total_ot /= 2.0
+    all_trades = sells + buys
+    if all_trades:
+        st.dataframe(pd.DataFrame(all_trades), hide_index=True, use_container_width=True)
+    else:
+        st.info("No trades — proposed weights match current weights.")
+    st.caption(
+        f"Total one-way turnover: {total_ot*100:.1f}% of portfolio. "
+        + (f"≈ ${total_ot * portfolio_value:,.0f}" if portfolio_value > 0 else "")
+    )
+
+    # ── Before / after metrics ─────────────────────────────────────────────────
+    st.subheader("Before / After Metrics")
+    import numpy as np
+
+    cur_w = np.array(result.current_weights)
+    prop_w = np.array(result.proposed_weights)
+    mu = np.array(result.mu)
+    vols = np.array(result.vols)
+
+    # Rebuild cov from corr and vols (stored in result)
+    corr = np.array(result.corr_matrix)
+    cov = corr * np.outer(vols, vols)
+
+    def _port_metrics(w: np.ndarray):
+        ret = float(mu @ w)
+        vol = float(np.sqrt(w @ cov @ w))
+        rf = result.risk_free_rate
+        sharpe = (ret - rf) / vol if vol > 1e-12 else 0.0
+        # HHI-based effective N
+        hhi = float(np.sum(w ** 2))
+        eff_n = 1.0 / hhi if hhi > 1e-12 else float(n)
+        return ret, vol, sharpe, eff_n
+
+    cur_ret, cur_vol, cur_sharpe, cur_eff_n = _port_metrics(cur_w)
+    prop_ret, prop_vol, prop_sharpe, prop_eff_n = _port_metrics(prop_w)
+
+    metrics_rows = [
+        {"Metric": "Expected Return", "Current": f"{cur_ret*100:.1f}%", "Proposed": f"{prop_ret*100:.1f}%",
+         "Δ": f"{(prop_ret-cur_ret)*100:+.1f}pp"},
+        {"Metric": "Volatility", "Current": f"{cur_vol*100:.1f}%", "Proposed": f"{prop_vol*100:.1f}%",
+         "Δ": f"{(prop_vol-cur_vol)*100:+.1f}pp"},
+        {"Metric": "Sharpe", "Current": f"{cur_sharpe:.3f}", "Proposed": f"{prop_sharpe:.3f}",
+         "Δ": f"{prop_sharpe-cur_sharpe:+.3f}"},
+        {"Metric": "Effective holdings (1/HHI)", "Current": f"{cur_eff_n:.1f}", "Proposed": f"{prop_eff_n:.1f}",
+         "Δ": f"{prop_eff_n-cur_eff_n:+.1f}"},
+    ]
+    st.dataframe(pd.DataFrame(metrics_rows), hide_index=True, use_container_width=True)
+    if abs(prop_sharpe - cur_sharpe) < 0.05:
+        st.caption(
+            "Δ Sharpe < 0.05 — within estimation error for a portfolio this size. "
+            "Don't over-interpret small improvements."
+        )
+
+    # ── Risk contributions ────────────────────────────────────────────────────
+    st.subheader("Risk Contribution — Capital Weight vs Risk Weight")
+    st.caption(
+        "Risk weight = each holding's share of total portfolio variance. "
+        "A name with 10% capital weight can drive 40% of risk if it is volatile and correlated."
+    )
+    rc_rows = []
+    for i, t in enumerate(result.tickers):
+        rc_rows.append({
+            "Ticker": t,
+            "Capital (current)": f"{result.current_weights[i]*100:.1f}%",
+            "Capital (proposed)": f"{result.proposed_weights[i]*100:.1f}%",
+            "Risk share (proposed)": f"{result.risk_contributions[i]*100:.1f}%",
+            "Risk/Capital ratio": f"{result.risk_contributions[i]/result.proposed_weights[i]:.2f}x"
+            if result.proposed_weights[i] > 0.001 else "—",
+        })
+    st.dataframe(pd.DataFrame(rc_rows), hide_index=True, use_container_width=True)
+
+    # ── Correlation ───────────────────────────────────────────────────────────
+    if n >= 2:
+        st.subheader("Highest Pairwise Correlations")
+        pair_rows = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                c = corr[i][j]
+                pair_rows.append({
+                    "Pair": f"{result.tickers[i]} / {result.tickers[j]}",
+                    "Correlation": f"{c:.2f}",
+                    "Note": "Redundant exposure — they move together" if abs(c) > 0.75 else "",
+                })
+        pair_rows.sort(key=lambda r: float(r["Correlation"]), reverse=True)
+        st.dataframe(pd.DataFrame(pair_rows[:6]), hide_index=True, use_container_width=True)
+
+
+def _render_sensitivity_interpretation(result) -> None:
+    """Explain what the sensitivity table is really telling you."""
+    st.caption(
+        "**Reading the table:** Names sitting *at a cap or at zero* show near-zero Δweight "
+        "under a ±2pp return shock — not because the optimizer is indifferent, but because "
+        "the constraint prevents them from moving. Those weights are constraint-driven. "
+        "Names far from any bound show the optimizer's actual responsiveness to return estimates."
+    )
+    # Identify immobile names (at cap or zero)
+    immobile = []
+    free = []
+    for row in result.sensitivity:
+        at_cap = any(row.ticker in bc for bc in result.binding_constraints)
+        at_zero = result.proposed_weights[result.tickers.index(row.ticker)] < 0.01
+        if at_cap or at_zero:
+            if row.ticker not in immobile:
+                immobile.append(row.ticker)
+        else:
+            if row.ticker not in free:
+                free.append(row.ticker)
+    if immobile:
+        st.caption(
+            f"**{', '.join(immobile)}**: Δweight ≈ 0pp — constrained (at cap or zero). "
+            "The optimizer can't move these names under a small shock."
+        )
+    if free:
+        st.caption(
+            f"**{', '.join(free)}**: responds to return shocks — these weights reflect optimizer conviction."
+        )
+
+
 def _render_optimizer_tab(
     method: str,
     tickers: list[str],
@@ -43,6 +342,8 @@ def _render_optimizer_tab(
     max_pos: float = 0.40,
     max_sec: float = 0.60,
     turnover: float = 0.0,
+    portfolio_value: float = 0.0,
+    priced_holdings=None,
 ) -> None:
     from core.optimizer import optimize_portfolio
 
@@ -95,31 +396,19 @@ def _render_optimizer_tab(
         st.metric("Sharpe", f"{result.sharpe:.2f}")
         st.caption(f"rf = {result.risk_free_rate * 100:.1f}%")
 
-    # Constraint status — always visible so the reader knows what bounds were active
-    with st.expander("Constraints & inputs", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Position cap", f"{result.max_position_weight * 100:.0f}%")
-        c2.metric("Sector cap", f"{result.max_sector_weight * 100:.0f}%")
-        c3.metric("Turnover penalty", f"{result.turnover_penalty:.2f}")
-        if result.binding_constraints:
-            st.warning("**Binding:** " + " · ".join(result.binding_constraints))
-        else:
-            st.success("No constraints binding — weights are unconstrained optima.")
-        st.caption(
-            f"Lookback: {result.lookback_days}d · Covariance: Ledoit-Wolf shrinkage · "
-            f"n={len(result.tickers)} assets (small matrix — treat weights as estimates, not precise allocations)"
-        )
+    # Constraints panel — interpretive, not just raw numbers (Issue 3)
+    with st.expander("Constraints & interpretation", expanded=True):
+        _render_constraints_panel(result, method, holdings_hash, max_pos, max_sec, turnover)
+
+    # Insights: trade list, metrics, risk, correlations (Issue 4)
+    with st.expander("Portfolio insights — trade list, metrics, risk", expanded=False):
+        _render_insights_panel(result, portfolio_value, priced_holdings)
 
     st.subheader("Sensitivity — how weights move when expected returns are shocked ±2%")
-    st.caption(
-        "At a portfolio optimum, first-order weight sensitivity is ≈ 0 by construction, "
-        "so bumping weights tells you nothing. This table shocks each holding's expected "
-        "return estimate ±2pp and shows how the optimizer re-allocates."
-    )
+    _render_sensitivity_interpretation(result)
     # Use structured sensitivity rows when available (new API), fall back to legacy dict
     sens_rows = []
     if result.sensitivity:
-        from core.optimizer import SensitivityRow
         proposed_map = dict(zip(result.tickers, result.proposed_weights))
         current_map = dict(zip(result.tickers, result.current_weights))
         by_ticker: dict[str, dict] = {}
@@ -151,12 +440,22 @@ def _render_optimizer_tab(
     summary_key = f"_opt_summary_{method}_{holdings_hash or '_'.join(result.tickers)}"
     with st.expander("Written explanation", expanded=(summary_key not in st.session_state)):
         if summary_key not in st.session_state:
-            from core.optimizer import generate_optimizer_summary
+            from core.optimizer import generate_optimizer_summary, _build_fallback_summary
             from ui.components import streaming_container
             container = st.empty()
-            with st.spinner("Generating explanation (Sonnet)…"):
-                summary_iter = generate_optimizer_summary(result, method)
-                st.session_state[summary_key] = streaming_container(summary_iter, container)
+            try:
+                with st.spinner("Generating explanation (Sonnet)…"):
+                    summary_iter = generate_optimizer_summary(result, method)
+                    st.session_state[summary_key] = streaming_container(summary_iter, container)
+            except Exception as exc:
+                _log.exception("Optimizer summary LLM call failed for method=%s", method)
+                fallback = _build_fallback_summary(result, method)
+                st.session_state[summary_key] = fallback
+                container.markdown(fallback)
+                st.caption(
+                    f"⚠ LLM explanation unavailable ({type(exc).__name__}). "
+                    "Showing template-based summary. Click 'Regenerate' to retry."
+                )
         else:
             st.markdown(st.session_state[summary_key])
         if st.button("Regenerate explanation", key=f"portfolio_analysis__regen_summary__{method}"):
@@ -367,16 +666,19 @@ def render_portfolio_analysis_page() -> None:
             _render_optimizer_tab(
                 "max_sharpe", eq_tickers, current_weights, holdings_hash,
                 sector_map=sector_map, max_pos=max_pos, max_sec=max_sec, turnover=turnover,
+                portfolio_value=tv, priced_holdings=priced_eq,
             )
         with opt_tabs[1]:
             _render_optimizer_tab(
                 "min_vol", eq_tickers, current_weights, holdings_hash,
                 sector_map=sector_map, max_pos=max_pos, max_sec=max_sec, turnover=turnover,
+                portfolio_value=tv, priced_holdings=priced_eq,
             )
         with opt_tabs[2]:
             _render_optimizer_tab(
                 "risk_parity", eq_tickers, current_weights, holdings_hash,
                 sector_map=sector_map, max_pos=max_pos, max_sec=max_sec, turnover=turnover,
+                portfolio_value=tv, priced_holdings=priced_eq,
             )
 
     st.divider()
@@ -390,7 +692,15 @@ def render_portfolio_analysis_page() -> None:
 
     st.divider()
     st.subheader("Per-Stock Scenario Cards")
-    _render_scenario_cards_section(eq_tickers)
+
+    # Collect optimizer results for portfolio aggregation (use max_sharpe tab)
+    opt_result = st.session_state.get(f"_opt_max_sharpe_{holdings_hash}")
+    proposed_map = (
+        dict(zip(opt_result.tickers, opt_result.proposed_weights)) if opt_result else {}
+    )
+    current_map_global = dict(zip(eq_tickers, current_weights))
+
+    _render_scenario_cards_section(eq_tickers, current_map_global, proposed_map)
 
     st.divider()
     _back_button(key="portfolio_analysis__back_bottom")
@@ -398,73 +708,142 @@ def render_portfolio_analysis_page() -> None:
 
 
 def _scenario_card(scenario: Scenario, current_price: float | None) -> None:
-    name_lower = scenario.scenario.lower()
-    if "bull" in name_lower:
-        color = "🟢"
-    elif "bear" in name_lower:
-        color = "🔴"
-    else:
-        color = "🔵"
-    st.markdown(f"**{color} {scenario.scenario.title()}**")
-    st.caption(f"P = {scenario.probability * 100:.0f}%")
-    if scenario.price_target is not None:
+    CASE_ICON = {"bull": "🟢", "base": "🔵", "bear": "🔴"}
+    icon = CASE_ICON.get(scenario.scenario, "⚪")
+    st.markdown(f"**{icon} {scenario.scenario.title()}** · P = {scenario.probability * 100:.0f}%")
+    if scenario.price_target is not None and current_price:
+        st.metric(
+            "Price Target",
+            f"${scenario.price_target:.0f}",
+            delta=f"{(scenario.price_target/current_price - 1)*100:+.1f}%",
+        )
+    elif scenario.price_target is not None:
         st.metric("Price Target", f"${scenario.price_target:.0f}")
     if scenario.implied_return is not None:
         sign = "+" if scenario.implied_return >= 0 else ""
         st.metric("Implied Return", f"{sign}{scenario.implied_return * 100:.1f}%")
     if scenario.narrative:
-        st.markdown(scenario.narrative[:300])
+        st.markdown(scenario.narrative)
     if scenario.drivers:
-        for d in scenario.drivers[:3]:
-            st.markdown(f"- {d.name}")
+        for d in scenario.drivers:
+            st.markdown(f"- **{d.name}**")
 
 
-def _render_scenario_cards_section(tickers: list[str]) -> None:
+def _render_scenario_cards_section(
+    tickers: list[str],
+    current_weights: dict[str, float],
+    proposed_weights: dict[str, float],
+) -> None:
+    """Auto-load scenarios per holding and show portfolio-level aggregation."""
     from core.analyze import analyze_ticker
 
+    # Load each ticker — auto-load with spinner (no intermediate button)
     for ticker in tickers:
-        with st.expander(f"{ticker} — click to expand scenarios"):
-            cache_key = f"_scenario_{ticker}"
+        cache_key = f"_scenario_{ticker}"
+        with st.expander(f"{ticker}", expanded=True):
             if cache_key not in st.session_state:
-                if st.button(f"Load scenarios for {ticker}", key=f"portfolio_analysis__scenario_load__{ticker}"):
-                    with st.spinner(f"Analyzing {ticker}…"):
-                        try:
-                            st.session_state[cache_key] = analyze_ticker(ticker)
-                        except Exception as exc:
-                            st.session_state[cache_key] = exc
-                    st.rerun()
-            else:
-                result = st.session_state[cache_key]
-                if isinstance(result, Exception):
-                    st.error(f"Analysis failed: {result}")
-                    if st.button(f"Retry {ticker}", key=f"portfolio_analysis__scenario_retry__{ticker}"):
+                with st.spinner(f"Loading scenarios for {ticker}…"):
+                    try:
+                        st.session_state[cache_key] = analyze_ticker(ticker)
+                    except Exception as exc:
+                        st.session_state[cache_key] = exc
+
+            result = st.session_state.get(cache_key)
+            if result is None:
+                st.caption("Not yet loaded.")
+                continue
+            if isinstance(result, Exception):
+                st.error(f"Analysis failed: {result}")
+                col_retry, _ = st.columns([1, 4])
+                with col_retry:
+                    if st.button("Retry", key=f"portfolio_analysis__scenario_retry__{ticker}"):
                         del st.session_state[cache_key]
                         st.rerun()
-                else:
-                    analysis = result
-                    label = analysis.company_name or ticker
-                    price_str = f"${analysis.current_price:.2f}" if analysis.current_price else "—"
-                    st.caption(f"{label} · Current: {price_str}")
+                continue
 
-                    if not analysis.scenarios:
-                        st.info("No scenario data available for this ticker.")
-                    else:
-                        ordered = sorted(
-                            analysis.scenarios,
-                            key=lambda s: ["bull", "base", "bear"].index(s.scenario)
-                            if s.scenario in ["bull", "base", "bear"] else 99,
-                        )
-                        cols = st.columns(len(ordered))
-                        for col, scenario in zip(cols, ordered):
-                            with col:
-                                _scenario_card(scenario, analysis.current_price)
+            analysis = result
+            label = analysis.company_name or ticker
+            price_str = f"${analysis.current_price:.2f}" if analysis.current_price else "—"
+            st.caption(f"{label} · Current: {price_str}")
 
-                    portfolio_name = st.query_params.get("portfolio", "")
-                    drill_url = f"?view=ticker&symbol={ticker}&from=portfolio"
-                    if portfolio_name:
-                        drill_url += f"&portfolio={portfolio_name}"
-                    st.link_button(
-                        f"Drill into {ticker} →",
-                        url=drill_url,
-                        help="Opens in this tab. Cmd-click (Mac) or Ctrl-click (Win) to open in a new tab.",
-                    )
+            if not analysis.scenarios:
+                st.info("No scenario data available for this ticker.")
+            else:
+                ordered = sorted(
+                    analysis.scenarios,
+                    key=lambda s: ["bull", "base", "bear"].index(s.scenario)
+                    if s.scenario in ["bull", "base", "bear"] else 99,
+                )
+                cols = st.columns(len(ordered))
+                for col, scenario in zip(cols, ordered):
+                    with col:
+                        _scenario_card(scenario, analysis.current_price)
+
+            portfolio_name = st.query_params.get("portfolio", "")
+            drill_url = f"?view=ticker&symbol={ticker}&from=portfolio"
+            if portfolio_name:
+                drill_url += f"&portfolio={portfolio_name}"
+            st.link_button(
+                f"Drill into {ticker} →",
+                url=drill_url,
+                help="Opens in this tab. Cmd-click (Mac) or Ctrl-click (Win) to open in a new tab.",
+            )
+
+    # Portfolio-level aggregation
+    _render_scenario_aggregation(tickers, current_weights, proposed_weights)
+
+
+def _render_scenario_aggregation(
+    tickers: list[str],
+    current_weights: dict[str, float],
+    proposed_weights: dict[str, float],
+) -> None:
+    """Weighted bull/base/bear portfolio return under current and proposed weights."""
+    # Collect per-ticker implied returns for each scenario label
+    scenario_returns: dict[str, dict[str, float]] = {}  # ticker → {label: implied_return}
+    for ticker in tickers:
+        analysis = st.session_state.get(f"_scenario_{ticker}")
+        if not analysis or isinstance(analysis, Exception) or not analysis.scenarios:
+            continue
+        for s in analysis.scenarios:
+            if s.implied_return is not None:
+                scenario_returns.setdefault(ticker, {})[s.scenario] = s.implied_return
+
+    if not scenario_returns:
+        return
+
+    # Only aggregate over tickers that have all three cases
+    complete_tickers = [t for t in tickers if set(scenario_returns.get(t, {}).keys()) >= {"bull", "base", "bear"}]
+    if not complete_tickers:
+        return
+
+    st.divider()
+    st.subheader("Portfolio Scenario Aggregation")
+    st.caption(
+        "Weighted return = Σ (position weight × holding's implied return) under each scenario. "
+        "Only includes holdings with all three scenarios loaded."
+    )
+
+    agg_rows = []
+    for label in ["bull", "base", "bear"]:
+        cur_ret = sum(
+            current_weights.get(t, 0) * scenario_returns[t][label]
+            for t in complete_tickers
+            if label in scenario_returns.get(t, {})
+        )
+        prop_ret = sum(
+            proposed_weights.get(t, 0) * scenario_returns[t][label]
+            for t in complete_tickers
+            if label in scenario_returns.get(t, {})
+        )
+        agg_rows.append({
+            "Scenario": label.title(),
+            "Weighted Return (current weights)": f"{cur_ret*100:+.1f}%",
+            "Weighted Return (proposed weights)": f"{prop_ret*100:+.1f}%",
+            "Δ": f"{(prop_ret-cur_ret)*100:+.1f}pp",
+        })
+    st.dataframe(pd.DataFrame(agg_rows), hide_index=True, use_container_width=True)
+    st.caption(
+        f"Aggregated over: {', '.join(complete_tickers)}. "
+        "Missing tickers excluded — load them above to include in aggregation."
+    )
