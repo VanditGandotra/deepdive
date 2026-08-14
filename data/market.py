@@ -14,7 +14,7 @@ from requests.adapters import HTTPAdapter
 import config as _cfg
 from config import TTL_FUNDAMENTALS, TTL_NEWS, TTL_PRICES
 from data.cache import (get_cache_obj, get_stale_cache_obj, record_freshness, set_cache_obj)
-from data.resilience import CircuitBreaker, retry, SourceUnavailable
+from data.resilience import CircuitBreaker, redact, retry, SourceUnavailable
 from analysis.schemas import (
     AnalystTarget, Fundamentals, InsiderTransaction,
     InstitutionalHolder, NewsItem, PriceBar, PriceData, ShortInterest,
@@ -371,7 +371,7 @@ def get_fundamentals(ticker: str) -> Fundamentals:
             return result
         except Exception as exc:
             _CB_YFINANCE.record_failure()
-            detail = str(exc)
+            detail = redact(str(exc))
             outcomes.append({"provider": "yfinance", "status": "failed", "detail": detail})
             errors.append(f"yfinance: {detail}")
             logger.warning("yfinance fundamentals failed for %s: %s", ticker, exc)
@@ -397,7 +397,7 @@ def get_fundamentals(ticker: str) -> Fundamentals:
             return result
         except Exception as exc:
             _CB_FMP.record_failure()
-            detail = str(exc)
+            detail = redact(str(exc))
             outcomes.append({"provider": "fmp", "status": "failed", "detail": detail})
             errors.append(f"fmp: {detail}")
             logger.warning("FMP fundamentals failed for %s: %s", ticker, exc)
@@ -417,7 +417,7 @@ def get_fundamentals(ticker: str) -> Fundamentals:
             return result
         except Exception as exc:
             _CB_STOOQ.record_failure()
-            detail = str(exc)
+            detail = redact(str(exc))
             outcomes.append({"provider": "stooq", "status": "failed", "detail": detail})
             errors.append(f"stooq: {detail}")
             logger.warning("Stooq fundamentals failed for %s: %s", ticker, exc)

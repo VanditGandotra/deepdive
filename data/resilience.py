@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import re
 import time
 from typing import Any, Callable, Optional, Tuple, TypeVar
 
@@ -10,6 +11,31 @@ import httpx
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+
+# Query-param names that may carry secrets
+_SECRET_PARAMS = re.compile(
+    r"([?&])(apikey|api_key|token|access_token|key|secret|password|passwd|auth)[^&]*",
+    re.IGNORECASE,
+)
+# URLs with a scheme — redact to scheme://host/path only
+_URL_PATTERN = re.compile(r"https?://[^\s\"'>]+")
+
+
+def redact(text: str) -> str:
+    """Scrub API keys and secrets from error strings before they reach the UI.
+
+    Strips query-string params that carry secrets and replaces any URL's query
+    string with '?<redacted>' so the host+path remain readable for debugging.
+    """
+    def _scrub_url(m: re.Match) -> str:
+        url = m.group(0)
+        # Strip query string entirely from URLs — show scheme://host/path only
+        base = url.split("?")[0]
+        if "?" in url:
+            return base + "?<redacted>"
+        return base
+
+    return _URL_PATTERN.sub(_scrub_url, text)
 
 
 def retry(
@@ -122,7 +148,10 @@ class CircuitBreaker:
     def record_failure(self) -> None:
         with self._lock:
             self._failures += 1
-            if self._failures >= self._threshold and self._opened_at is None:
+            if self._failures >= self._threshold:
+                # Reset the cooldown timer on every probe failure so that a failed
+                # half-open probe restarts the full cooldown rather than staying
+                # permanently half-open.
                 self._opened_at = time.time()
                 logger.warning("CircuitBreaker [%s] opened after %d failures", self.name, self._failures)
 

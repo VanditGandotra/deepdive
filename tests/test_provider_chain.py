@@ -416,7 +416,53 @@ class TestFmpHandlesErrorDictResponse:
             fake_resp.json.return_value = {"Error Message": "Invalid API KEY. Please retry or visit..."}
 
             with patch("httpx.get", return_value=fake_resp):
-                with pytest.raises(ValueError, match="unexpected response"):
+                with pytest.raises(ValueError, match="FMP profile error"):
                     FmpMarketProvider().get_fundamentals("AAPL")
         finally:
             cfg.FMP_API_KEY = original_key
+
+
+class TestRedactSecurity:
+    """P0: API keys must never appear in outcome detail strings."""
+
+    def test_redact_strips_url_query_string(self):
+        from data.resilience import redact
+        url = "https://financialmodelingprep.com/api/v3/profile/AAPL?apikey=SUPERSECRETKEY123"
+        result = redact(url)
+        assert "SUPERSECRETKEY123" not in result
+        assert "financialmodelingprep.com" in result
+        assert "?<redacted>" in result
+
+    def test_redact_url_embedded_in_exception(self):
+        from data.resilience import redact
+        msg = (
+            "Client error '403 Forbidden' for url "
+            "'https://financialmodelingprep.com/api/v3/profile/NVDA?apikey=ABC123XYZ'"
+        )
+        result = redact(msg)
+        assert "ABC123XYZ" not in result
+        assert "financialmodelingprep.com" in result
+
+    def test_redact_leaves_no_url_query_strings(self):
+        from data.resilience import redact
+        msg = "GET https://example.com/endpoint?token=secret&other=value failed"
+        result = redact(msg)
+        assert "secret" not in result
+        assert "?<redacted>" in result
+
+    def test_fmp_http_error_message_is_secret_free(self):
+        """FmpMarketProvider must not include the API key in any raised exception."""
+        import config as cfg
+        from data.providers.fmp import FmpMarketProvider
+        fake_resp = MagicMock()
+        fake_resp.status_code = 403
+        fake_resp.json.return_value = {}
+        with patch("httpx.get", return_value=fake_resp):
+            with pytest.raises(ValueError) as exc_info:
+                FmpMarketProvider().get_fundamentals("NVDA")
+        msg = str(exc_info.value)
+        # Must not contain the real key value
+        if cfg.FMP_API_KEY:
+            assert cfg.FMP_API_KEY not in msg
+        # Must not contain apikey= query param pattern
+        assert "apikey=" not in msg
