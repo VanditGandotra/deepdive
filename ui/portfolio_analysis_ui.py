@@ -10,6 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from core.schemas import Scenario
+from core.text_render import render_md, sanitize_markdown
 
 _VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
 
@@ -723,10 +724,10 @@ def _scenario_card(scenario: Scenario, current_price: float | None) -> None:
         sign = "+" if scenario.implied_return >= 0 else ""
         st.metric("Implied Return", f"{sign}{scenario.implied_return * 100:.1f}%")
     if scenario.narrative:
-        st.markdown(scenario.narrative)
+        render_md(scenario.narrative)
     if scenario.drivers:
         for d in scenario.drivers:
-            st.markdown(f"- **{d.name}**")
+            render_md(f"- **{d.name}**")
 
 
 def _render_scenario_cards_section(

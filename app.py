@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterator, List, Optional
 logger = logging.getLogger(__name__)
 
 import streamlit as st
+from core.text_render import render_md, sanitize_markdown
 
 st.set_page_config(
     page_title="DeepDive Research",
@@ -177,7 +178,7 @@ def tab_overview(ticker: str, settings: Dict) -> None:
                             pass
                         brief = build_pre_earnings_brief(ticker, fund, bm, ests, kpi_sums)
                     st.session_state[brief_key] = brief
-                st.markdown(st.session_state.get(brief_key, "Brief unavailable."))
+                render_md(st.session_state.get(brief_key, "Brief unavailable."))
     except Exception:
         pass
 
@@ -199,7 +200,7 @@ def tab_overview(ticker: str, settings: Dict) -> None:
         except Exception as exc:
             st.caption(f"State-of-play unavailable: {exc}")
     else:
-        st.markdown(st.session_state[sop_key])
+        render_md(st.session_state[sop_key])
 
     st.divider()
 
@@ -528,16 +529,16 @@ def tab_earnings_calls(ticker: str, settings: Dict) -> None:
                     st.caption(f"⚠ Signal scorecard unavailable: {_scorecard_err}")
                 st.markdown("**Key Themes**")
                 for theme in summary.key_themes:
-                    st.markdown(f"- {theme}")
+                    render_md(f"- {theme}")
                 if summary.guidance_items:
                     st.markdown("**Guidance**")
                     for g in summary.guidance_items:
                         dir_tag = {"raised": "+", "lowered": "-", "maintained": "="}.get(g.direction, "")
-                        st.markdown(f"- {dir_tag} **{g.metric}**: {g.value or '—'}")
+                        render_md(f"- {dir_tag} **{g.metric}**: {g.value or '—'}")
                 if summary.top_analyst_concerns_from_qa:
                     st.markdown("**Top Analyst Concerns (Q&A)**")
                     for c in summary.top_analyst_concerns_from_qa:
-                        st.markdown(f"- {c}")
+                        render_md(f"- {c}")
             if sentiment:
                 st.divider()
                 c1, c2, c3 = st.columns(3)
@@ -553,11 +554,11 @@ def tab_earnings_calls(ticker: str, settings: Dict) -> None:
                 if sentiment.evasiveness_flags:
                     with st.expander("Evasiveness flags"):
                         for flag in sentiment.evasiveness_flags:
-                            st.markdown(f"**{flag.analyst_question_topic}**: {flag.why_answer_seemed_indirect}")
+                            render_md(f"**{flag.analyst_question_topic}**: {flag.why_answer_seemed_indirect}")
                 if sentiment.hedging_index.example_phrases:
                     with st.expander(f"Hedging ({sentiment.hedging_index.level})"):
                         for phrase in sentiment.hedging_index.example_phrases:
-                            st.markdown(f'*"{phrase}"*')
+                            render_md(f'*"{phrase}"*')
 
     st.divider()
     st.markdown("**What Changed — 4-Quarter Synthesis**")
@@ -570,7 +571,7 @@ def tab_earnings_calls(ticker: str, settings: Dict) -> None:
                 text = streaming_container(synthesis_iter, container)
             st.session_state[synthesis_key] = text
         else:
-            st.markdown(st.session_state[synthesis_key])
+            render_md(st.session_state[synthesis_key])
     else:
         st.caption("Need at least 2 quarters for synthesis.")
 
@@ -589,9 +590,9 @@ def tab_earnings_calls(ticker: str, settings: Dict) -> None:
         from analysis.transcript_qa import answer_question
         with st.spinner("Searching transcripts…"):
             answer = answer_question(qa_input, transcripts)
-        st.markdown(answer)
+        render_md(answer)
     elif f"qa_last_answer_{ticker}" in st.session_state:
-        st.markdown(st.session_state[f"qa_last_answer_{ticker}"])
+        render_md(st.session_state[f"qa_last_answer_{ticker}"])
 
 
 def tab_news(ticker: str, settings: Dict) -> None:
@@ -760,7 +761,7 @@ def tab_analyst_mode(ticker: str, settings: Dict) -> None:
             with st.spinner("Computing quality flags (pure math)…"):
                 panel = cached_quality_panel(ticker)
             status_labels = {"green": "OK", "yellow": "WATCH", "red": "FLAG"}
-            st.markdown(f"**Overall: {panel.overall.title()}** — {panel.summary}")
+            render_md(f"**Overall: {panel.overall.title()}** — {panel.summary}")
             st.divider()
             for flag in panel.flags:
                 flag_label = status_labels.get(flag.status, flag.status.upper())
@@ -769,7 +770,7 @@ def tab_analyst_mode(ticker: str, settings: Dict) -> None:
                     if flag.observed_value:
                         st.metric("Observed", flag.observed_value)
                     st.caption(f"**Threshold:** {flag.threshold}")
-                    st.write(flag.explanation)
+                    render_md(flag.explanation)
         except Exception as exc:
             error_card("Quality flags error", str(exc))
 
@@ -778,7 +779,7 @@ def tab_analyst_mode(ticker: str, settings: Dict) -> None:
         st.subheader("Positioning — Short Interest, Insiders, Holders")
         try:
             pos = cached_positioning(ticker)
-            st.info(pos.synthesis)
+            st.info(sanitize_markdown(pos.synthesis))
             c1, c2 = st.columns(2)
             c1.metric("Short interest", f"{pos.short_interest_pct_float*100:.1f}%" if pos.short_interest_pct_float else "N/A")
             c2.metric("Days to cover", f"{pos.days_to_cover:.1f}" if pos.days_to_cover else "N/A")
@@ -890,7 +891,7 @@ def tab_thesis_memo(ticker: str, settings: Dict) -> None:
             except Exception as exc:
                 error_card("Thesis generation error", str(exc))
         elif f"thesis_text_{ticker}" in st.session_state:
-            st.markdown(st.session_state[f"thesis_text_{ticker}"])
+            render_md(st.session_state[f"thesis_text_{ticker}"])
 
     # ── Red team ──────────────────────────────────────────────────────────────
     with redteam_tab:
@@ -910,11 +911,11 @@ def tab_thesis_memo(ticker: str, settings: Dict) -> None:
 
         rt = st.session_state.get(rt_key)
         if rt:
-            st.markdown(f"**Strongest counter-argument:** {rt.strongest_counterargument}")
-            st.markdown(f"**Most fragile assumption:** {rt.most_fragile_assumption}")
-            st.markdown(f"**What bulls are ignoring:** {rt.what_bulls_are_ignoring}")
-            st.markdown(f"**What bears are ignoring:** {rt.what_bears_are_ignoring}")
-            st.error(f"**Fastest falsifier:** {rt.fastest_falsifier}")
+            render_md(f"**Strongest counter-argument:** {rt.strongest_counterargument}")
+            render_md(f"**Most fragile assumption:** {rt.most_fragile_assumption}")
+            render_md(f"**What bulls are ignoring:** {rt.what_bulls_are_ignoring}")
+            render_md(f"**What bears are ignoring:** {rt.what_bears_are_ignoring}")
+            st.error(sanitize_markdown(f"**Fastest falsifier:** {rt.fastest_falsifier}"))
 
     # ── Memo ─────────────────────────────────────────────────────────────────
     with memo_tab:
@@ -1166,7 +1167,7 @@ def tab_hiring_intel(url: str, domain: str) -> None:
     if roadmap:
         st.markdown("**What hiring reveals about strategy**")
         for signal in roadmap:
-            st.markdown(f"- {signal}")
+            render_md(f"- {signal}")
 
     if dept_counts:
         st.divider()
@@ -1189,59 +1190,239 @@ def tab_hiring_intel(url: str, domain: str) -> None:
         st.divider()
         st.markdown("**Standout / unusual roles**")
         for r in standout:
-            st.markdown(f"- {r}")
+            render_md(f"- {r}")
 
 
 def tab_competitors(url: str, domain: str) -> None:
-    from analysis.competitors import discover_competitors, build_competitive_comparison
-    from ui.components import error_card
+    from analysis.competitors import (
+        build_competitive_comparison, discover_competitors,
+        normalize_domain, resolve_name_to_domain, _domain_to_product_name,
+    )
+    from data.cache import delete_cache
+
+    _AUTO_KEY   = f"comp_auto__{domain}"      # {"competitors": [...], "diag": {...}}
+    _MANUAL_KEY = f"comp_manual__{domain}"    # [{name, domain, source="manual"}, ...]
+    _COMP_KEY   = f"comp_comparison__{domain}"  # {"text": "...", "diags": [...], "hash": "..."}
 
     st.caption("Auto-discovers 3-5 competitors then crawls each for a side-by-side feature comparison.")
 
-    comp_key = f"competitors__{domain}"
-    comp_data = st.session_state.get(comp_key)
-
-    if not comp_data:
-        # Use company intel summary if already fetched, otherwise web search covers the gap
+    # ── Step 1: Auto-discovery (runs once per domain per session) ─────────────
+    if _AUTO_KEY not in st.session_state:
         results_key = f"company_intel__{url}"
         ci = st.session_state.get(results_key)
         company_summary = (ci or {}).get("synthesis_text", "")
-
         with st.spinner("Searching for competitors (web search + Sonnet)…"):
-            competitors, discover_diag = discover_competitors(domain, company_summary)
-        if not competitors:
-            st.warning("Could not identify competitors automatically.")
-            with st.expander("Discovery diagnostic"):
-                st.json(discover_diag)
-            return
-        st.caption(f"Identified: {', '.join(c.get('name', c['domain']) for c in competitors)}")
-        with st.spinner(f"Gathering data on {len(competitors)} competitors…"):
-            comparison, crawl_diags = build_competitive_comparison(domain, company_summary, competitors)
-        st.session_state[comp_key] = {
-            "competitors": competitors,
-            "comparison": comparison,
-            "discover_diag": discover_diag,
-            "crawl_diags": crawl_diags,
-        }
-        comp_data = st.session_state[comp_key]
+            try:
+                comps, diag = discover_competitors(domain, company_summary)
+            except Exception as exc:
+                logger.exception("discover_competitors error for %s", domain)
+                comps, diag = [], {"error": str(exc)}
+        st.session_state[_AUTO_KEY] = {"competitors": comps, "diag": diag}
 
-    competitors = comp_data.get("competitors", [])
-    comparison = comp_data.get("comparison", "")
+    auto_result  = st.session_state[_AUTO_KEY]
+    auto_comps   = auto_result.get("competitors", [])
+    discover_diag = auto_result.get("diag", {})
+    manual_comps  = st.session_state.get(_MANUAL_KEY, [])
 
-    if competitors:
-        st.markdown("**Competitors identified**")
-        for c in competitors:
-            st.markdown(f"- [{c.get('name', c['domain'])}](https://{c['domain']})")
+    def _retry_discovery() -> None:
+        delete_cache(f"competitors_v2:discover:{domain}")
+        delete_cache(f"competitors_v2:search:{domain}")
+        st.session_state.pop(_AUTO_KEY, None)
+        st.session_state.pop(_COMP_KEY, None)
 
-    if comparison:
-        st.divider()
-        st.markdown(comparison)
+    # ── Step 2: Discovery banner ───────────────────────────────────────────────
+    if not auto_comps:
+        error_reason = discover_diag.get("error", "")
+        thin = discover_diag.get("web_search_thin", False)
+        msg = (
+            "Search returned too little data to identify competitors automatically"
+            if thin else
+            "Couldn't identify competitors automatically"
+        )
+        st.warning(f"{msg} — add them below or retry.", icon="⚠️")
+        col_retry, _ = st.columns([2, 5])
+        with col_retry:
+            if st.button("↺ Retry discovery", key="comp_retry"):
+                _retry_discovery()
+                st.rerun()
+        with st.expander("Discovery diagnostic"):
+            st.json(discover_diag)
+    else:
+        st.caption(
+            f"Auto-identified: {', '.join(c.get('name', c['domain']) for c in auto_comps)}"
+        )
+        if st.button("↺ Re-discover", key="comp_retry", help="Clear auto-discovered list and re-run discovery"):
+            _retry_discovery()
+            st.rerun()
 
-    with st.expander("Diagnostic log"):
-        st.json({
-            "discover": comp_data.get("discover_diag"),
-            "crawls": comp_data.get("crawl_diags"),
-        })
+    # ── Step 3: Manual competitor input (always shown) ────────────────────────
+    with st.expander("➕ Add competitors manually", expanded=not auto_comps):
+        st.caption(
+            "One per line or comma-separated · accepts: domain (`resolve.ai`), "
+            "URL (`https://resolve.ai/product`), or company name (`Resolve AI`)."
+        )
+        manual_input = st.text_area(
+            "Competitors",
+            placeholder="resolve.ai, traversal.com\ndatadoghq.com",
+            label_visibility="collapsed",
+            key=f"comp_input_{domain}",
+            height=80,
+        )
+        if st.button("Add", key=f"comp_add_{domain}", type="primary"):
+            raw_entries = [
+                e.strip()
+                for chunk in manual_input.replace("\n", ",").split(",")
+                for e in [chunk.strip()]
+                if e
+            ]
+            existing_norms = {
+                normalize_domain(c["domain"])
+                for c in auto_comps + st.session_state.get(_MANUAL_KEY, [])
+                if c.get("domain")
+            }
+            subject_norm = normalize_domain(domain)
+            added = 0
+
+            for raw in raw_entries:
+                if not raw:
+                    continue
+
+                # Resolve company name → domain via web search
+                if "." not in raw:
+                    with st.spinner(f"Resolving domain for '{raw}'…"):
+                        resolved = resolve_name_to_domain(raw)
+                    if resolved:
+                        norm = normalize_domain(resolved)
+                        st.caption(f"'{raw}' → {norm}")
+                    else:
+                        st.warning(f"Could not resolve '{raw}' to a domain. Try entering the domain directly.")
+                        continue
+                    entry_name = raw.title()
+                else:
+                    norm = normalize_domain(raw)
+                    entry_name = _domain_to_product_name(norm)
+
+                if norm == subject_norm:
+                    st.warning(f"'{norm}' is the subject company — skipping.")
+                    continue
+                if norm in existing_norms:
+                    st.info(f"'{norm}' is already in the list.")
+                    continue
+
+                total = len(auto_comps) + len(st.session_state.get(_MANUAL_KEY, [])) + added
+                if total >= 6:
+                    st.warning(f"Competitor cap (6) reached — '{norm}' not added. Remove one first.")
+                    break
+
+                st.session_state.setdefault(_MANUAL_KEY, []).append(
+                    {"name": entry_name, "domain": norm, "source": "manual"}
+                )
+                existing_norms.add(norm)
+                st.session_state.pop(_COMP_KEY, None)  # invalidate comparison
+                added += 1
+
+            if added:
+                st.rerun()
+
+    st.divider()
+
+    # ── Step 4: Unified competitor list with source badges + remove controls ──
+    all_comps = (
+        [{"source": "auto", **c} for c in auto_comps]
+        + list(st.session_state.get(_MANUAL_KEY, []))
+    )
+
+    if not all_comps:
+        st.info("No competitors in the list yet — add some above to run a comparison.")
+        return
+
+    if len(all_comps) > 5:
+        st.warning(
+            f"{len(all_comps)} competitors selected — each crawl takes ~20 s on first run, "
+            f"~{len(all_comps) * 20} s total. They are cached after the first run."
+        )
+
+    st.markdown("**Competitors:**")
+    for i, comp in enumerate(all_comps):
+        c1, c2, c3 = st.columns([1, 6, 1])
+        source = comp.get("source", "auto")
+        badge_bg = "#2D6A4F" if source == "auto" else "#3B4A6B"
+        with c1:
+            st.markdown(
+                f'<span style="background:{badge_bg};color:#fff;'
+                f'padding:1px 7px;border-radius:3px;font-size:0.72rem">'
+                f'{source}</span>',
+                unsafe_allow_html=True,
+            )
+        with c2:
+            name = comp.get("name", comp["domain"])
+            st.caption(f"[{name}](https://{comp['domain']}) — {comp['domain']}")
+        with c3:
+            if st.button("✕", key=f"comp_rm_{domain}_{i}", help="Remove"):
+                if source == "manual":
+                    st.session_state[_MANUAL_KEY] = [
+                        m for m in st.session_state.get(_MANUAL_KEY, [])
+                        if m["domain"] != comp["domain"]
+                    ]
+                else:
+                    st.session_state[_AUTO_KEY]["competitors"] = [
+                        c for c in auto_comps if c["domain"] != comp["domain"]
+                    ]
+                st.session_state.pop(_COMP_KEY, None)
+                st.rerun()
+
+    st.divider()
+
+    # ── Step 5: Run / display comparison ──────────────────────────────────────
+    comp_hash = ",".join(sorted(c["domain"] for c in all_comps))
+    cached_comp = st.session_state.get(_COMP_KEY)
+    result_current = cached_comp is not None and cached_comp.get("hash") == comp_hash
+
+    results_key = f"company_intel__{url}"
+    ci = st.session_state.get(results_key)
+    company_summary = (ci or {}).get("synthesis_text", "")
+
+    # Auto-run: first visit after successful discovery with no manual modifications.
+    # Reproduces the original single-step behaviour for the happy path.
+    first_auto_run = (
+        not result_current
+        and auto_comps
+        and not st.session_state.get(_MANUAL_KEY)
+        and cached_comp is None
+    )
+    if first_auto_run:
+        with st.spinner(f"Gathering data on {len(all_comps)} competitors…"):
+            text, crawl_diags = build_competitive_comparison(
+                domain, company_summary, all_comps
+            )
+        st.session_state[_COMP_KEY] = {"text": text, "diags": crawl_diags, "hash": comp_hash}
+        cached_comp = st.session_state[_COMP_KEY]
+        result_current = True
+
+    # Show button for user-triggered (re)runs — when list changed or no result yet
+    if not result_current:
+        col_btn, col_hint = st.columns([2, 5])
+        with col_btn:
+            run_label = "▶ Run comparison" if cached_comp is None else "↺ Update comparison"
+            if st.button(run_label, key=f"comp_run_{domain}", type="primary"):
+                with st.spinner(f"Crawling {len(all_comps)} competitors and generating comparison…"):
+                    text, crawl_diags = build_competitive_comparison(
+                        domain, company_summary, all_comps
+                    )
+                st.session_state[_COMP_KEY] = {
+                    "text": text, "diags": crawl_diags, "hash": comp_hash,
+                }
+                st.rerun()
+        with col_hint:
+            st.caption(
+                f"Will crawl {len(all_comps)} site(s) — ~{len(all_comps)*20} s first run, "
+                "cached per-domain after that."
+            )
+
+    if result_current:
+        render_md(cached_comp["text"])
+        with st.expander("Diagnostic log"):
+            st.json({"discover": discover_diag, "crawls": cached_comp.get("diags")})
 
 
 def tab_reviews(url: str, domain: str) -> None:
@@ -1287,7 +1468,7 @@ def tab_reviews(url: str, domain: str) -> None:
         ):
             summary = r.get("sentiment_summary")
             if summary:
-                st.info(summary)
+                st.info(sanitize_markdown(summary))
 
             col1, col2 = st.columns(2)
             pros = r.get("top_pros") or []
@@ -1296,12 +1477,12 @@ def tab_reviews(url: str, domain: str) -> None:
                 if pros:
                     st.markdown("**Top pros**")
                     for p in pros:
-                        st.markdown(f"+ {p}")
+                        render_md(f"+ {p}")
             with col2:
                 if cons:
                     st.markdown("**Top cons**")
                     for c in cons:
-                        st.markdown(f"- {c}")
+                        render_md(f"- {c}")
 
             use_cases = r.get("common_use_cases") or []
             if use_cases:
@@ -1361,7 +1542,7 @@ def tab_company_intel(url: str, domain: str) -> None:
             f"{cached['pages_fetched']} pages fetched · "
             f"{cached['intels_extracted']} with intel"
         )
-        st.markdown(cached["synthesis_text"])
+        render_md(cached["synthesis_text"])
         return
 
     # ── First run for this URL this session — execute pipeline ────────────────
@@ -1454,7 +1635,7 @@ def tab_product_deep_dive(url: str, domain: str) -> None:
             with st.expander("Docs discovery coverage report", expanded=False):
                 for line in cached["probe_log"]:
                     st.text(line)
-        st.markdown(cached["explainer_text"])
+        render_md(cached["explainer_text"])
         if cached.get("images"):
             st.divider()
             st.markdown(f"**Screenshots** ({len(cached['images'])})")

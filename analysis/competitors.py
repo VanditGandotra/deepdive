@@ -32,13 +32,81 @@ Given summaries of a target product and its competitors, write a structured comp
 Be specific — name actual features. Under 500 words.
 """)
 
+_THIN_SEARCH_THRESHOLD = 50  # chars — below this, treat web search as effectively empty
+
+
+def normalize_domain(raw: str) -> str:
+    """Normalize a URL, domain, or bare hostname to a lowercase registrable domain.
+
+    Strips scheme (https://), www prefix, path, query string, fragment, and
+    trailing punctuation. Returns lowercase bare domain suitable for deduplication
+    and use as a crawl target.
+
+    Examples:
+        "https://www.resolve.ai/product?ref=g" → "resolve.ai"
+        "Resolve.AI"                            → "resolve.ai"
+        "traversal.com/"                        → "traversal.com"
+    """
+    raw = raw.strip().lower()
+    # Strip scheme
+    raw = re.sub(r"^https?://", "", raw)
+    # Strip auth (user:pass@)
+    raw = raw.split("@")[-1]
+    # Strip www.
+    raw = re.sub(r"^www\.", "", raw)
+    # Strip path, query, fragment — take only the host part
+    raw = raw.split("/")[0].split("?")[0].split("#")[0]
+    # Strip port
+    raw = raw.split(":")[0]
+    # Strip trailing dots
+    raw = raw.rstrip(".")
+    return raw
+
 
 def _domain_to_product_name(domain: str) -> str:
-    bare = domain.split("/")[0].lower()
+    bare = normalize_domain(domain)
     parts = bare.split(".")
-    if parts[0] == "www" and len(parts) > 1:
-        parts = parts[1:]
     return parts[0].title()
+
+
+def resolve_name_to_domain(company_name: str) -> Optional[str]:
+    """Resolve a plain company name (no dot) to a registrable domain via web search.
+
+    Returns None if resolution fails so the caller can surface a clear error.
+    """
+    result = llm.web_search_synthesis(
+        f'What is the official website of "{company_name}"? '
+        "Reply with just the domain, e.g. example.com — no https:// or www.",
+        max_tokens=120,
+    )
+    if not result:
+        return None
+    # Extract the first thing that looks like a domain in the response
+    m = re.search(r"\b([a-z0-9][a-z0-9\-]*\.[a-z]{2,}(?:\.[a-z]{2,})?)\b", result.lower())
+    return normalize_domain(m.group(1)) if m else None
+
+
+def _validate_messages(messages: list) -> None:
+    """Assert that every message has a content field the API will accept.
+
+    Raises ValueError naming the bad field so the error surfaces before the
+    round-trip to Anthropic (which would return a cryptic 400).
+    """
+    for i, msg in enumerate(messages):
+        content = msg.get("content")
+        if not isinstance(content, (str, list)):
+            raise ValueError(
+                f"messages[{i}].content must be str or list[dict], "
+                f"got {type(content).__name__!r}. "
+                "Single text_block() must be wrapped: content=[text_block(...)]"
+            )
+        if isinstance(content, list):
+            for j, block in enumerate(content):
+                if not isinstance(block, dict):
+                    raise ValueError(
+                        f"messages[{i}].content[{j}] must be dict, "
+                        f"got {type(block).__name__!r}"
+                    )
 
 
 def discover_competitors(domain: str, company_summary: str = "") -> Tuple[List[Dict], Dict]:
@@ -66,16 +134,34 @@ def discover_competitors(domain: str, company_summary: str = "") -> Tuple[List[D
     diag["web_search_chars"] = len(web_context)
     logger.info("[competitors] web_search for %s: %d chars", domain, len(web_context))
 
+    # Treat near-empty search result as no result to avoid passing thin context to the LLM.
+    if len(web_context) < _THIN_SEARCH_THRESHOLD:
+        logger.warning(
+            "[competitors] web search returned only %d chars for %s — treating as empty",
+            len(web_context), domain,
+        )
+        web_context = ""
+        diag["web_search_thin"] = True
+
+    if not web_context and not company_summary:
+        diag["error"] = (
+            f"Web search returned no usable results ({diag['web_search_chars']} chars) "
+            "and no company summary is available. Add competitors manually."
+        )
+        return [], diag
+
     # Step 2: Sonnet structures the result into JSON
     context_for_llm = web_context or company_summary or f"Product: {product_name} at {domain}"
     messages = [{
         "role": "user",
-        "content": llm.text_block(
+        # content must be a list — a bare text_block() dict causes a 400
+        "content": [llm.text_block(
             f"Product: {product_name} ({domain})\n\n"
             f"Research findings:\n{context_for_llm[:2000]}\n\n"
             "List the 3-5 closest direct competitors. Return JSON array only."
-        ),
+        )],
     }]
+    _validate_messages(messages)
     try:
         raw = llm.call(
             SONNET, messages,
@@ -86,6 +172,9 @@ def discover_competitors(domain: str, company_summary: str = "") -> Tuple[List[D
         m = re.search(r"\[.*\]", raw, re.DOTALL)
         result = json.loads(m.group()) if m else []
         result = [r for r in result if isinstance(r, dict) and "domain" in r][:5]
+        # Normalize domains returned by the LLM
+        for r in result:
+            r["domain"] = normalize_domain(r["domain"])
         diag["competitors_found"] = [r.get("name") for r in result]
     except Exception as exc:
         logger.warning("competitor discovery failed for %s: %s", domain, exc)
@@ -165,11 +254,16 @@ def build_competitive_comparison(
 ) -> Tuple[str, List[Dict]]:
     """
     Crawl competitors in parallel and produce a Sonnet comparison narrative.
+
+    ``competitor_list`` is source-agnostic — it may contain auto-discovered
+    entries, manually added entries, or a mix. Each dict must have a ``domain``
+    key; ``name`` and ``source`` are optional extras that are preserved in diags.
+
     Returns (markdown_text, list_of_crawl_diags).
     """
     cache_key = (
         f"competitors_v2:compare:{target_domain}:"
-        + ",".join(c.get("domain", "") for c in competitor_list)
+        + ",".join(sorted(c.get("domain", "") for c in competitor_list))
     )
     cached = get_cache_obj(cache_key)
     if cached is not None:
@@ -191,6 +285,7 @@ def build_competitive_comparison(
             except Exception as exc:
                 result, diag = None, {"domain": comp.get("domain"), "error": str(exc)}
             diag["name"] = comp.get("name")
+            diag["source"] = comp.get("source", "auto")
             crawl_diags.append(diag)
             logger.info("[competitors] crawl result for %s: %s", comp.get("domain"), diag)
             if result:
@@ -216,6 +311,7 @@ def build_competitive_comparison(
             ),
         ],
     }]
+    _validate_messages(messages)
     try:
         result = llm.call(
             SONNET, messages,

@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterator, Optional
 
 import streamlit as st
 
+from core.text_render import sanitize_markdown, render_md
 from data.cache import get_freshness, get_session_stats
 
 
@@ -142,6 +143,17 @@ h3 { font-size: 1rem !important; font-weight: 600 !important; }
 
 /* Divider */
 hr { border-color: rgba(26,26,26,0.08) !important; margin: 0.75rem 0 !important; }
+
+/* Defence-in-depth: prevent KaTeX/code overflow from bleeding into adjacent columns.
+   The primary fix is $ escaping in sanitize_markdown(); this is the safety net. */
+[data-testid="stMarkdownContainer"] {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    max-width: 100%;
+}
+.katex-display { overflow-x: auto; }
+.katex { overflow-x: auto; max-width: 100%; }
+pre, code { overflow-x: auto; max-width: 100%; }
 </style>
 """
 
@@ -331,20 +343,21 @@ def delta_card(delta: Optional[Dict[str, Any]]) -> None:
             st.caption("No material changes detected.")
         else:
             for b in bullets:
-                st.markdown(f"- {b}")
+                render_md(f"- {b}")
 
 
 def streaming_container(
     token_iter: Iterator[str],
     placeholder: Optional[Any] = None,
 ) -> str:
+    """Stream tokens to markdown, sanitizing $ per chunk to suppress KaTeX."""
     container = placeholder or st.empty()
     full_text = ""
     for token in token_iter:
         full_text += token
-        container.markdown(full_text + "▌")
-    container.markdown(full_text)
-    return full_text
+        container.markdown(sanitize_markdown(full_text) + "▌")
+    container.markdown(sanitize_markdown(full_text))
+    return full_text  # raw text returned so callers can store/process it
 
 
 def cost_footer(session_id: str) -> None:

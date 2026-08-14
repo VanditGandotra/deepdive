@@ -23,9 +23,15 @@ def _make_analysis(ticker="AAPL") -> TickerAnalysis:
 
 
 def _call_scenario_card(scenario: Scenario, current_price=None):
-    """Call _scenario_card with st patched, return the mock st."""
+    """Call _scenario_card with st patched, return the mock st.
+
+    Patches both ``ui.portfolio_analysis_ui.st`` (direct calls) and
+    ``streamlit.markdown`` (calls routed via ``render_md`` from core.text_render)
+    so both paths are captured by the same mock.
+    """
     mock_st = MagicMock()
-    with patch("ui.portfolio_analysis_ui.st", mock_st):
+    with patch("ui.portfolio_analysis_ui.st", mock_st), \
+         patch("streamlit.markdown", mock_st.markdown):
         from ui.portfolio_analysis_ui import _scenario_card
         _scenario_card(scenario, current_price)
     return mock_st
