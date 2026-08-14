@@ -1,11 +1,23 @@
 """Portfolio analysis page: optimizer + Monte Carlo, triggered by ?view=portfolio_analysis."""
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import re
+
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 
 from core.schemas import Scenario
+
+_VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
+
+
+def _holdings_hash(tickers: list[str], weights: list[float]) -> str:
+    """Stable hash of (ticker, weight) pairs — used to key session-state cache."""
+    content = "|".join(f"{t}:{w:.6f}" for t, w in sorted(zip(tickers, weights)))
+    return hashlib.sha256(content.encode()).hexdigest()[:12]
 
 
 def _back_button(key: str = "portfolio_analysis__back") -> None:
@@ -15,18 +27,27 @@ def _back_button(key: str = "portfolio_analysis__back") -> None:
         st.rerun()
 
 
-def _render_optimizer_tab(method: str, tickers: list[str], current_weights: list[float]) -> None:
+def _render_optimizer_tab(
+    method: str,
+    tickers: list[str],
+    current_weights: list[float],
+    holdings_hash: str = "",
+) -> None:
     from core.optimizer import optimize_portfolio
 
-    try:
-        result = optimize_portfolio(
-            tickers=tickers,
-            current_weights=current_weights,
-            method=method,
-        )
-    except Exception as exc:
-        st.error(f"Optimizer error: {exc}")
-        return
+    result_key = f"_opt_{method}_{holdings_hash}"
+    if result_key not in st.session_state:
+        try:
+            st.session_state[result_key] = optimize_portfolio(
+                tickers=tickers,
+                current_weights=current_weights,
+                method=method,
+            )
+        except Exception as exc:
+            st.error(f"Optimizer error: {exc}")
+            return
+
+    result = st.session_state[result_key]
 
     col_chart, col_metrics = st.columns([3, 1])
 
@@ -46,7 +67,7 @@ def _render_optimizer_tab(method: str, tickers: list[str], current_weights: list
         ))
         fig.update_layout(
             barmode="group",
-            yaxis_title="Weight (%)",
+            yaxis_title="Portfolio Weight (%)",
             height=320,
             legend=dict(orientation="h", y=1.1),
             margin=dict(l=4, r=4, t=32, b=4),
@@ -96,7 +117,7 @@ def _render_optimizer_tab(method: str, tickers: list[str], current_weights: list
         st.dataframe(pd.DataFrame(sens_rows), hide_index=True, use_container_width=True)
 
     # Prose summary — collapsible, default open on first render, does not re-run optimizer
-    summary_key = f"_opt_summary_{method}_{'_'.join(result.tickers)}"
+    summary_key = f"_opt_summary_{method}_{holdings_hash or '_'.join(result.tickers)}"
     with st.expander("Written explanation", expanded=(summary_key not in st.session_state)):
         if summary_key not in st.session_state:
             from core.optimizer import generate_optimizer_summary
@@ -112,14 +133,18 @@ def _render_optimizer_tab(method: str, tickers: list[str], current_weights: list
             st.rerun()
 
 
-def _render_montecarlo(weights: list[float], tickers: list[str]) -> None:
+def _render_montecarlo(weights: list[float], tickers: list[str], holdings_hash: str = "") -> None:
     from core.montecarlo import run_montecarlo
 
-    try:
-        mc = run_montecarlo(weights=weights, tickers=tickers)
-    except Exception as exc:
-        st.error(f"Monte Carlo error: {exc}")
-        return
+    mc_key = f"_mc_{holdings_hash}"
+    if mc_key not in st.session_state:
+        try:
+            st.session_state[mc_key] = run_montecarlo(weights=weights, tickers=tickers)
+        except Exception as exc:
+            st.error(f"Monte Carlo error: {exc}")
+            return
+
+    mc = st.session_state[mc_key]
 
     days = list(range(mc.horizon_days + 1))
 
@@ -215,14 +240,35 @@ def render_portfolio_analysis_page() -> None:
     priced_eq = [h for h in equity_holdings_all if h.ticker not in failed]
 
     if failed_eq:
-        failed_weight = sum(h.weight or 0 for h in equity_holdings_all if h.ticker in failed_eq)
+        from data.cache import delete_cache, get_cache_obj
+
+        # Distinguish tickers that have never successfully been cached from transient failures
+        never_cached = {t for t in failed_eq if get_cache_obj(f"market:{t}:fundamentals") is None}
+
         st.error(
-            f"**Price fetch failed for: {', '.join(failed_eq)}** "
-            f"(combined portfolio weight: {failed_weight * 100:.1f}%). "
+            f"**Price fetch failed for {len(failed_eq)} ticker(s).** "
             "Optimizer weights from incomplete data would be misleading."
         )
+        for t in failed_eq:
+            h_match = next((h for h in equity_holdings_all if h.ticker == t), None)
+            pct_str = f"{(h_match.weight or 0) * 100:.1f}% of portfolio" if h_match else "unknown weight"
+            if not _VALID_TICKER_RE.match(t):
+                reason = "⚠ likely invalid — ticker symbols are 1–5 uppercase letters"
+            elif t in never_cached:
+                reason = "never successfully fetched — may be a new or unrecognized ticker"
+            else:
+                reason = "previously fetched; transient failure — retry likely to succeed"
+            st.markdown(f"- **{t}** ({pct_str}): {reason}")
+
+        col_retry, _ = st.columns([2, 3])
+        with col_retry:
+            if st.button("↺ Retry failed tickers", key="portfolio_analysis__retry_failed"):
+                for t in failed_eq:
+                    delete_cache(f"market:{t}:fundamentals")
+                st.rerun()
+
         if not st.checkbox(
-            f"Proceed anyway — exclude {', '.join(failed_eq)} and optimize over remaining positions",
+            f"Proceed without {', '.join(failed_eq)} — optimize over remaining {len(priced_eq)} positions",
             key="portfolio_analysis__proceed_with_missing",
         ):
             st.stop()
@@ -236,22 +282,31 @@ def render_portfolio_analysis_page() -> None:
         st.warning("Need at least 2 priced equity positions to run optimizer.")
         return
 
+    holdings_hash = _holdings_hash(eq_tickers, current_weights)
+
     st.subheader("Optimizer")
     opt_tabs = st.tabs(["Max Sharpe", "Min Vol", "Risk Parity"])
 
-    with st.spinner("Running optimizers..."):
+    _methods = ["max_sharpe", "min_vol", "risk_parity"]
+    _needs_opt = any(f"_opt_{m}_{holdings_hash}" not in st.session_state for m in _methods)
+    _opt_ctx = st.spinner("Running optimizers...") if _needs_opt else contextlib.nullcontext()
+
+    with _opt_ctx:
         with opt_tabs[0]:
-            _render_optimizer_tab("max_sharpe", eq_tickers, current_weights)
+            _render_optimizer_tab("max_sharpe", eq_tickers, current_weights, holdings_hash)
         with opt_tabs[1]:
-            _render_optimizer_tab("min_vol", eq_tickers, current_weights)
+            _render_optimizer_tab("min_vol", eq_tickers, current_weights, holdings_hash)
         with opt_tabs[2]:
-            _render_optimizer_tab("risk_parity", eq_tickers, current_weights)
+            _render_optimizer_tab("risk_parity", eq_tickers, current_weights, holdings_hash)
 
     st.divider()
     st.subheader("Monte Carlo Simulation")
 
-    with st.spinner("Running Monte Carlo (10,000 paths)..."):
-        _render_montecarlo(current_weights, eq_tickers)
+    _needs_mc = f"_mc_{holdings_hash}" not in st.session_state
+    _mc_ctx = st.spinner("Running Monte Carlo (10,000 paths)...") if _needs_mc else contextlib.nullcontext()
+
+    with _mc_ctx:
+        _render_montecarlo(current_weights, eq_tickers, holdings_hash)
 
     st.divider()
     st.subheader("Per-Stock Scenario Cards")
